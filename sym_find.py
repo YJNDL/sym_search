@@ -48,7 +48,7 @@ import random
 import traceback
 from collections import defaultdict, Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
 
@@ -185,215 +185,24 @@ class EvaluatorResult:
 
 
 @dataclass
-class SlabValidationResult:
-    ok: bool
-    reason: Optional[str] = None
-    metrics: Dict[str, object] = field(default_factory=dict)
-
-
-def record_slab_validation(metrics: Dict[str, object],
-                           stage: str,
-                           result: SlabValidationResult,
-                           final: bool = False):
-    """Record slab validation metadata under *metrics*."""
-
-    if not stage:
-        stage = "default"
-    stage_map = metrics.setdefault("slab_validation", {})
-    stage_map[stage] = {
-        **result.metrics,
-        "ok": result.ok,
-        "reason": result.reason,
-    }
-    if final or "is_2d_valid" not in metrics:
-        metrics["is_2d_valid"] = result.ok
-        if result.ok:
-            metrics.pop("is_2d_reason", None)
-        else:
-            metrics["is_2d_reason"] = result.reason
-
-
-@dataclass
 class LocalEnvRule:
-    species: Optional[Tuple[str, ...]]
+    """Element-specific motif / CN bounds used by the LocalEnv checker."""
+
     cn_range: Tuple[float, float]
-    threshold: float
-    preferred_motifs: Tuple[str, ...]
-    label: str = "default"
-    species_lower: Tuple[str, ...] = field(init=False, repr=False)
-
-    def __post_init__(self):
-        if self.species:
-            self.species_lower = tuple(s.lower() for s in self.species)
-        else:
-            self.species_lower = tuple()
-
-    def matches(self, specie: str) -> bool:
-        if not self.species_lower:
-            return False
-        return specie.lower() in self.species_lower
-
-    def describe(self) -> Dict[str, object]:
-        return {
-            "label": self.label,
-            "species": self.species,
-            "cn_range": self.cn_range,
-            "threshold": self.threshold,
-            "preferred_motifs": self.preferred_motifs,
-        }
+    motifs: List[str] = field(default_factory=list)
 
 
 @dataclass
-class LocalEnvReport:
-    ok: bool
-    reason: Optional[str]
-    summary: Dict[str, object]
+class LocalEnvConfig:
+    """Normalized configuration bundle for local environment constraints."""
 
-    def to_metrics(self) -> Dict[str, object]:
-        return dict(self.summary)
-
-
-class LocalEnvConstraintChecker:
-    def __init__(self, config: Optional[Dict[str, object]], fallback_cn_range: Tuple[int, int]):
-        fallback = (float(fallback_cn_range[0]), float(fallback_cn_range[1]))
-        cfg_defaults = (config or {}).get("defaults") or {}
-        default_rule = LocalEnvRule(
-            species=None,
-            cn_range=tuple(cfg_defaults.get("cn_range", fallback)),
-            threshold=float(cfg_defaults.get("threshold", 0.0)),
-            preferred_motifs=tuple(cfg_defaults.get("preferred_motifs", ())),
-            label=str(cfg_defaults.get("label", "default")),
-        )
-        self.default_rule = default_rule
-
-        rules_cfg = (config or {}).get("rules") or []
-        self.rules: List[LocalEnvRule] = []
-        for entry in rules_cfg:
-            rule = LocalEnvRule(
-                species=tuple(entry.get("species")) if entry.get("species") else None,
-                cn_range=tuple(entry.get("cn_range", fallback)),
-                threshold=float(entry.get("threshold", default_rule.threshold)),
-                preferred_motifs=tuple(entry.get("preferred_motifs", default_rule.preferred_motifs)),
-                label=str(entry.get("label", "rule")),
-            )
-            self.rules.append(rule)
-
-        motif_types = sorted({m for rule in [self.default_rule] + self.rules for m in rule.preferred_motifs})
-        self._motif_types = tuple(motif_types)
-        self._cnn = CrystalNN()
-        self._lsop = LocalStructOrderParams(list(self._motif_types)) if self._motif_types else None
-        self._rule_summary = [rule.describe() for rule in ([self.default_rule] + self.rules)]
-
-    def analyze(self, struct: Structure) -> LocalEnvReport:
-        species_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"count": 0, "cn_fail": 0, "motif_fail": 0})
-        cn_fail = 0
-        motif_fail = 0
-        failures: List[Dict[str, object]] = []
-
-        for idx, site in enumerate(struct.sites):
-            specie = site.species_string
-            rule = self._rule_for(specie)
-            cn_val, cn_ok = self._compute_cn(struct, idx, rule)
-            motif_meta = self._compute_motif(struct, idx, rule)
-
-            species_stats[specie]["count"] += 1
-            if not cn_ok:
-                species_stats[specie]["cn_fail"] += 1
-                cn_fail += 1
-            if motif_meta and not motif_meta["ok"]:
-                species_stats[specie]["motif_fail"] += 1
-                motif_fail += 1
-
-            if (not cn_ok) or (motif_meta and not motif_meta["ok"]):
-                fail_entry = {
-                    "index": idx,
-                    "species": specie,
-                    "cn": None if cn_val is None else round(cn_val, 4),
-                    "cn_range": rule.cn_range,
-                    "cn_ok": cn_ok,
-                    "rule": rule.label,
-                }
-                if motif_meta:
-                    fail_entry.update({
-                        "best_motif": motif_meta.get("best_motif"),
-                        "best_score": motif_meta.get("best_score"),
-                        "threshold": motif_meta.get("threshold"),
-                        "motif_ok": motif_meta.get("ok"),
-                    })
-                failures.append(fail_entry)
-
-        ok = (cn_fail == 0) and (motif_fail == 0)
-        reason = None
-        if failures:
-            first = failures[0]
-            if not first.get("cn_ok", True):
-                reason = (
-                    f"{first['species']} 位点 #{first['index']} 的 CN={first['cn']} 超出 [{first['cn_range'][0]}, {first['cn_range'][1]}]"
-                )
-            elif not first.get("motif_ok", True):
-                reason = (
-                    f"{first['species']} 位点 #{first['index']} motif 匹配失败："
-                    f"{first.get('best_motif')} 得分={first.get('best_score')} < 阈值 {first.get('threshold')}"
-                )
-
-        species_summary = {k: dict(v) for k, v in species_stats.items()}
-        summary: Dict[str, object] = {
-            "ok": ok,
-            "total_sites": len(struct.sites),
-            "cn_failures": cn_fail,
-            "motif_failures": motif_fail,
-            "species_stats": species_summary,
-            "rules": self._rule_summary,
-        }
-        if failures:
-            summary["fail_sites"] = failures[:8]
-
-        return LocalEnvReport(ok=ok, reason=reason, summary=summary)
-
-    def _rule_for(self, specie: str) -> LocalEnvRule:
-        for rule in self.rules:
-            if rule.matches(specie):
-                return rule
-        return self.default_rule
-
-    def _compute_cn(self, struct: Structure, index: int, rule: LocalEnvRule):
-        try:
-            cn_val = float(self._cnn.get_cn(struct, index))
-        except Exception:
-            cn_val = None
-        if cn_val is None:
-            return None, False
-        lo, hi = rule.cn_range
-        return cn_val, bool(lo - 1e-6 <= cn_val <= hi + 1e-6)
-
-    def _compute_motif(self, struct: Structure, index: int, rule: LocalEnvRule) -> Optional[Dict[str, object]]:
-        if not self._lsop or not rule.preferred_motifs:
-            return None
-        try:
-            values = self._lsop.get_order_parameters(struct, index)
-        except Exception:
-            values = None
-        if values is None:
-            return {"ok": False, "best_motif": None, "best_score": None, "threshold": rule.threshold}
-        motif_map = {motif: float(values[i]) for i, motif in enumerate(self._motif_types)}
-        best_motif = None
-        best_score = None
-        for motif in rule.preferred_motifs:
-            if motif not in motif_map:
-                continue
-            score = motif_map[motif]
-            if best_score is None or score > best_score:
-                best_score = score
-                best_motif = motif
-        ok = True
-        if rule.preferred_motifs:
-            ok = bool(best_score is not None and best_score >= rule.threshold)
-        return {
-            "ok": ok,
-            "best_motif": best_motif,
-            "best_score": None if best_score is None else round(best_score, 4),
-            "threshold": rule.threshold,
-        }
+    enabled: bool = False
+    threshold: float = 0.65
+    default_motifs: List[str] = field(default_factory=list)
+    global_cn_range: Tuple[float, float] = (0.0, 1000.0)
+    species_subset: Set[str] = field(default_factory=set)
+    element_rules: Dict[str, LocalEnvRule] = field(default_factory=dict)
+    crystalnn_kwargs: Dict[str, object] = field(default_factory=dict)
 
 
 class GeometryConstraints:
@@ -1149,6 +958,123 @@ def load_settings(config_path: str) -> argparse.Namespace:
     params["local_env_constraints"] = normalize_local_env_constraints(params, tuple(params["cn_range"]))
 
     return argparse.Namespace(**params)
+
+
+def _parse_cn_range(value, fallback: Optional[Sequence[float]] = None) -> Tuple[float, float]:
+    """Return a normalized CN window from various config inputs."""
+
+    if value is None:
+        if fallback is None:
+            return 0.0, 1000.0
+        if isinstance(fallback, (list, tuple)) and len(fallback) == 2:
+            lo, hi = fallback
+        else:
+            raise ValueError(f"cn_range 兜底必须包含两个数值，收到 {fallback!r}")
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        lo, hi = value
+    elif isinstance(value, str) and "," in value:
+        lo, hi = value.split(",", 1)
+    else:
+        raise ValueError(f"cn_range 需包含两个数值，收到 {value!r}")
+    lo_f = float(lo)
+    hi_f = float(hi)
+    if lo_f > hi_f:
+        lo_f, hi_f = hi_f, lo_f
+    return lo_f, hi_f
+
+
+def _canonicalize_motif_list(raw) -> List[str]:
+    motifs: List[str] = []
+    if not raw:
+        return motifs
+    for token in raw:
+        if token is None:
+            continue
+        name = str(token).strip()
+        if not name:
+            continue
+        canonical = canonicalize_motif_name(name)
+        if canonical not in motifs:
+            motifs.append(canonical)
+    return motifs
+
+
+def build_local_env_config(args: argparse.Namespace) -> LocalEnvConfig:
+    """Merge JSON/CLI fields into a single LocalEnvConfig object."""
+
+    raw_cfg = dict(getattr(args, "local_env_constraints", {}) or {})
+    global_cn_range = _parse_cn_range(
+        raw_cfg.get("global_cn_range"),
+        getattr(args, "cn_range", None),
+    )
+    default_motifs = _canonicalize_motif_list(
+        raw_cfg.get("default_motifs")
+        or raw_cfg.get("motifs")
+        or raw_cfg.get("preferred_motifs")
+    )
+    species_tokens = raw_cfg.get("species_subset") or raw_cfg.get("species") or []
+    species_subset = {
+        str(token).strip().lower()
+        for token in species_tokens
+        if str(token).strip()
+    }
+    nn_kwargs = raw_cfg.get("crystalnn_kwargs") or {}
+    if not isinstance(nn_kwargs, dict):
+        raise TypeError("local_env_constraints.crystalnn_kwargs 需为对象")
+
+    element_rules: Dict[str, LocalEnvRule] = {}
+
+    def _register_rule(elem: str,
+                       cn_range: Optional[Sequence[float]] = None,
+                       motifs: Optional[List[str]] = None):
+        if elem is None:
+            return
+        key = str(elem).strip()
+        if not key:
+            return
+        cn_rng = _parse_cn_range(cn_range, global_cn_range)
+        motif_list = motifs if motifs else list(default_motifs)
+        element_rules[key.lower()] = LocalEnvRule(cn_range=cn_rng, motifs=motif_list)
+
+    legacy_elements = raw_cfg.get("elements") or {}
+    if legacy_elements and not isinstance(legacy_elements, dict):
+        raise TypeError("local_env_constraints.elements 需为 {symbol: {...}} 格式")
+    for elem, elem_cfg in legacy_elements.items():
+        elem_dict = dict(elem_cfg or {})
+        cn_rng = elem_dict.get("cn_range")
+        motifs = _canonicalize_motif_list(
+            elem_dict.get("preferred_motifs")
+            or elem_dict.get("motifs")
+            or elem_dict.get("default_motifs")
+        )
+        _register_rule(elem, cn_range=cn_rng, motifs=motifs or None)
+
+    cn_rules = raw_cfg.get("cn_rules") or {}
+    if cn_rules and not isinstance(cn_rules, dict):
+        raise TypeError("local_env_constraints.cn_rules 需为 {symbol: {...}} 格式")
+    for elem, rule_cfg in cn_rules.items():
+        rule_dict = dict(rule_cfg or {})
+        prefer_rng = rule_dict.get("preferred_range")
+        allowed_rng = rule_dict.get("allowed_range")
+        cn_rng = prefer_rng if prefer_rng is not None else allowed_rng
+        motifs = _canonicalize_motif_list(
+            rule_dict.get("preferred_motifs") or rule_dict.get("motifs")
+        )
+        _register_rule(elem, cn_range=cn_rng or allowed_rng, motifs=motifs or None)
+
+    enabled_default = bool(raw_cfg) and (bool(element_rules) or bool(default_motifs) or bool(species_subset))
+    enabled = as_bool(raw_cfg.get("enabled", enabled_default))
+    threshold = float(raw_cfg.get("threshold", 0.65))
+
+    return LocalEnvConfig(
+        enabled=enabled,
+        threshold=threshold,
+        default_motifs=list(default_motifs),
+        global_cn_range=global_cn_range,
+        species_subset=species_subset,
+        element_rules=element_rules,
+        crystalnn_kwargs=dict(nn_kwargs),
+    )
 
 
 # ------------------------------ 几何与邻接（通用元素版） ------------------------------
@@ -1960,39 +1886,29 @@ class CandidatePreprocessor:
 class LocalEnvConstraintChecker:
     """Element-aware CrystalNN + motif constraints inspired by aimd_env_tracker."""
 
-    def __init__(self,
-                 config: Optional[Dict[str, object]] = None,
-                 legacy_cn_range: Optional[Tuple[int, int]] = None):
-        cfg = dict(config or {})
-        self.enabled = as_bool(cfg.get("enabled", bool(cfg)))
-        self.threshold = float(cfg.get("threshold", 0.65))
-        legacy_lo, legacy_hi = (legacy_cn_range or (0, 1000))
-        self.global_cn_range = self._parse_cn_range(cfg.get("global_cn_range"), (legacy_lo, legacy_hi))
-        default_motifs = self._canonicalize_motifs(cfg.get("default_motifs"))
-        self.species_filter = {
-            str(s).strip().lower()
-            for s in (cfg.get("species_subset") or [])
-            if str(s).strip()
-        }
-        nn_kwargs = cfg.get("crystalnn_kwargs") or {}
-        if not isinstance(nn_kwargs, dict):
-            nn_kwargs = {}
-        self._nn_kwargs = dict(nn_kwargs)
+    def __init__(self, config: Optional[LocalEnvConfig] = None):
+        cfg = config or LocalEnvConfig()
+        self.enabled = bool(cfg.enabled)
+        self.threshold = float(cfg.threshold)
+        self.global_cn_range = (
+            float(cfg.global_cn_range[0]),
+            float(cfg.global_cn_range[1]),
+        )
+        self.species_filter = {s.lower() for s in cfg.species_subset if s}
+        self._nn_kwargs = dict(cfg.crystalnn_kwargs or {})
         elements_cfg = {}
-        motif_pool = set(default_motifs)
-        raw_elements = cfg.get("elements") or {}
-        if raw_elements and not isinstance(raw_elements, dict):
-            raise TypeError("local_env_constraints.elements 需为 {symbol: {...}} 格式")
-        for elem, elem_cfg in raw_elements.items():
-            elem_key = str(elem).strip()
+        motif_pool = set(cfg.default_motifs)
+        for elem_key, rule in (cfg.element_rules or {}).items():
             if not elem_key:
                 continue
-            elem_dict = dict(elem_cfg or {})
-            cn_range = self._parse_cn_range(elem_dict.get("cn_range"), self.global_cn_range)
-            motifs = self._canonicalize_motifs(elem_dict.get("preferred_motifs"))
+            motifs = list(rule.motifs)
             if not motifs:
-                motifs = list(default_motifs)
+                motifs = list(cfg.default_motifs)
             motif_pool.update(motifs)
+            cn_range = (
+                float(rule.cn_range[0]),
+                float(rule.cn_range[1]),
+            )
             elements_cfg[elem_key.lower()] = {
                 "cn_range": cn_range,
                 "motifs": motifs,
@@ -2000,7 +1916,7 @@ class LocalEnvConstraintChecker:
         self.element_rules = elements_cfg
         self.default_rule = {
             "cn_range": self.global_cn_range,
-            "motifs": list(default_motifs),
+            "motifs": list(cfg.default_motifs),
         }
         self._motif_list = sorted(motif_pool)
         self._motif_index = {name: idx for idx, name in enumerate(self._motif_list)}
@@ -2010,36 +1926,6 @@ class LocalEnvConstraintChecker:
             self._nn = CrystalNN(**self._nn_kwargs)
             if self._motif_list:
                 self._lop = LocalStructOrderParams(self._motif_list)
-
-    @staticmethod
-    def _parse_cn_range(value, fallback: Tuple[float, float]) -> Tuple[float, float]:
-        if value is None:
-            return float(fallback[0]), float(fallback[1])
-        if isinstance(value, (list, tuple)) and len(value) == 2:
-            lo, hi = value
-        elif isinstance(value, str) and "," in value:
-            lo, hi = value.split(",", 1)
-        else:
-            raise ValueError(f"cn_range 需包含两个数值，收到 {value!r}")
-        lo_f = float(lo)
-        hi_f = float(hi)
-        if lo_f > hi_f:
-            lo_f, hi_f = hi_f, lo_f
-        return lo_f, hi_f
-
-    @staticmethod
-    def _canonicalize_motifs(raw) -> List[str]:
-        motifs: List[str] = []
-        if not raw:
-            return motifs
-        for item in raw:
-            token = str(item).strip()
-            if not token:
-                continue
-            canonical = canonicalize_motif_name(token)
-            if canonical not in motifs:
-                motifs.append(canonical)
-        return motifs
 
     def check(self, struct: Structure):
         metrics: Dict[str, object] = {
@@ -2419,13 +2305,19 @@ class CandidateEvaluator:
                  args,
                  ref_stats: dict,
                  symprecs: Sequence[float],
-                 cn_range: Tuple[int, int],
                  projector: Optional[SlabProjector] = None,
+                 local_env_config: Optional[LocalEnvConfig] = None,
                  local_env_checker: Optional[LocalEnvConstraintChecker] = None):
         self.args = args
         self.ref_stats = ref_stats
         self.symprecs = tuple(symprecs)
+        if local_env_config is not None:
+            cn_lo, cn_hi = local_env_config.global_cn_range
+        else:
+            cn_lo, cn_hi = _parse_cn_range(getattr(args, "cn_range", None), (0.0, 1000.0))
+        self.cn_lo, self.cn_hi = float(cn_lo), float(cn_hi)
         self.projector = projector
+        self.local_env_config = local_env_config
         self.local_env_checker = local_env_checker
 
     def evaluate(self,
@@ -2451,6 +2343,13 @@ class CandidateEvaluator:
             env_summary = env_report.to_metrics()
             if not env_report.ok:
                 return EvaluatorResult(False, reason=f"local_env: {env_report.reason}")
+
+        local_env_metrics = None
+        if self.local_env_checker:
+            env_ok, env_metrics, env_reason = self.local_env_checker.check(struct)
+            local_env_metrics = env_metrics
+            if not env_ok:
+                return EvaluatorResult(False, reason=env_reason or "local_env 检查失败")
 
         local_env_metrics = None
         if self.local_env_checker:
@@ -2651,15 +2550,17 @@ def main():
     constraints = GeometryConstraints(args)
     generator = CandidateGenerator(args)
     motif_checker = MotifReasonablenessChecker(getattr(args, "motif_checker", {}))
-    local_env_checker = LocalEnvConstraintChecker(getattr(args, "local_env_constraints", {}), (cn_lo, cn_hi))
+    local_env_config = build_local_env_config(args)
+    args.local_env_config = local_env_config
+    local_env_checker = LocalEnvConstraintChecker(local_env_config)
     preprocessor = CandidatePreprocessor(args, slab_projector, constraints, motif_checker=motif_checker)
     geom_filter = GeometryFilter(args, constraints, symprecs, slab_projector)
     evaluator = CandidateEvaluator(
         args,
         ref_stats,
         symprecs,
-        (cn_lo, cn_hi),
         projector=slab_projector,
+        local_env_config=local_env_config,
         local_env_checker=local_env_checker,
     )
 

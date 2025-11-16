@@ -96,21 +96,23 @@
     "threshold": 0.7,
     "global_cn_range": [2, 6],
     "default_motifs": ["tetrahedral", "trigonal planar"],
-    "elements": {
+    "cn_rules": {
       "Ga": {
-        "cn_range": [3, 4],
+        "allowed_range": [2, 6],
+        "preferred_range": [3, 4],
         "preferred_motifs": ["tetrahedral", "trigonal planar"]
       },
       "Sb": {
-        "cn_range": [3, 5],
+        "allowed_range": [2, 6],
+        "preferred_range": [3, 5],
         "preferred_motifs": ["trigonal pyramidal", "octahedral"]
       }
     }
   }
   ```
-  - `global_cn_range` 用作未单独配置元素的兜底配位区间，也会在缺失 `elements` 时回退。
+  - `global_cn_range` 用作未单独配置元素的兜底配位区间，也会在缺失 `cn_rules`/`elements` 时回退；如果仍沿用旧版 `cn_range`，会被自动当成该兜底窗口。
   - `default_motifs` 会在单个元素未声明 `preferred_motifs` 时提供公共 motif 列表。
-  - `elements` 中的每个元素都可以自定义 `cn_range` 与 `preferred_motifs`，所有 motif 名称同样支持“tetrahedral/square planar”这类别名，脚本会在内部映射成 `LocalStructOrderParams` 的 token。
+  - `cn_rules` 中可以分别声明 `allowed_range`（硬性 CN 范围）与 `preferred_range`（更窄的优选窗口，如果缺失则回退到 `allowed_range`），并在需要时附加元素专属的 `preferred_motifs`。若继续使用旧版 `elements` + `cn_range` 的写法，脚本也会自动解析并与 `cn_rules` 合并，后一者具有更高优先级。
   - 若开启该模块，`CandidateEvaluator` 会在 SG 验证前对整结构运行 CrystalNN，任何元素 CN 越界或 motif 分数低于 `threshold` 的候选都会被立刻淘汰，调试信息会记录在 `meta.local_env` 中。
 - `debug_save_all_cands` / `debug_save_rejected`：现在会按照“raw/prepped/geom_fail/eval_fail/accepted”分阶段把结构保存在 `SG_xxx/debug/` 目录，方便定位问题。
 
