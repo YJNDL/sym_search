@@ -56,6 +56,8 @@
 - `layer_thickness`：可选的“目标层厚”，一旦设置，所有候选都会被压缩/拉伸到该绝对厚度，再在其外侧追加 `vacuum_thickness` 指定的真空。若留空，则默认保留原始厚度，只在超过 `layer_thickness_max` 时才压缩。
 - `layer_thickness_max`：当 `layer_thickness` 未设置时，作为薄片厚度的上限。若希望只做重心对齐，可把该值设为 0 并单独调 `slab_center`。
 - `slab_center`：薄片在真空方向上的中心位置（分数坐标，默认 0.5，对应居中真空）。
+- `slab_center_tol`：控制薄片实际质心与目标 `slab_center` 的容差，默认 0.05（按轴长的 5% 计算）。也可以直接填写绝对 Å 值，一旦超出
+  即视为“非 2D”结构并在预处理阶段拒收。
 - `layer_axis`：指定哪条晶轴作为“法向 + 真空方向”（支持 `a/b/c` 或 `x/y/z`）。
 - `reslab_after_relax`：若开启硬球松弛，松弛后的结构也会自动重新投影回薄片，以防 3D bulk 重新出现。
 

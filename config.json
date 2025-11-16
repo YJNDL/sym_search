@@ -31,6 +31,7 @@
     "vacuum_buffer": 1.0,
     "layer_axis": "c",
     "slab_center": 0.5,
+    "slab_center_tol": 0.05,
     "layer_thickness": 4.0,
     "layer_thickness_max": 5.0,
     "reslab_after_relax": true,

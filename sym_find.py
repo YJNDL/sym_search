@@ -47,7 +47,7 @@ import argparse
 import random
 import traceback
 from collections import defaultdict, Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
@@ -182,6 +182,20 @@ class EvaluatorResult:
     primitive: Optional[Structure] = None
     meta: Optional[dict] = None
     reason: Optional[str] = None
+
+
+@dataclass
+class SlabValidationResult:
+    """Outcome bundle for slab-geometry validation checks."""
+
+    valid: bool
+    reason: Optional[str] = None
+    axis_index: int = 2
+    axis_length: float = 0.0
+    layer_bounds: Tuple[float, float] = (0.0, 0.0)
+    layer_thickness: float = 0.0
+    vacuum_length: float = 0.0
+    center_offset: float = 0.0
 
 
 @dataclass
@@ -789,7 +803,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "layer_thickness_max": 3.0,
         "layer_axis": "c",
         "slab_center": 0.5,
-        "slab_center_tol": 0.02,
+        "slab_center_tol": 0.05,
         "reslab_after_relax": True,
 
         # 用于最近邻统计和 CN 的元素对（可以改成任意中心/邻居元素）
@@ -924,6 +938,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
     params["surface_frac"] = float(params["surface_frac"])
     params["layer_axis"] = str(params.get("layer_axis", "c"))
     params["layer_axis_index"] = axis_to_index(params["layer_axis"])
+    params["slab_center_tol"] = float(params.get("slab_center_tol", 0.05))
     params["reslab_after_relax"] = as_bool(params.get("reslab_after_relax", True))
 
     params["bond_scaling_mode"] = str(params.get("bond_scaling_mode", "soft")).lower()
@@ -1500,6 +1515,68 @@ def surface_corrugation_angstrom(struct: Structure,
     return max(corr_top, corr_bot), thickness
 
 
+def validate_slab_geometry(struct: Structure,
+                           axis_index: int = 2,
+                           max_layer_thickness: Optional[float] = None,
+                           min_vacuum_thickness: Optional[float] = None,
+                           slab_center: float = 0.5,
+                           slab_center_tol: float = 0.05,
+                           tol: float = 1e-3) -> SlabValidationResult:
+    """Check whether a structure respects the requested 2D slab constraints."""
+
+    axis_len = float(struct.lattice.lengths[axis_index])
+    coords = np.array([s.frac_coords[axis_index] * axis_len for s in struct.sites], dtype=float)
+    if coords.size == 0:
+        return SlabValidationResult(
+            valid=False,
+            reason="structure has no atoms",
+            axis_index=axis_index,
+            axis_length=axis_len,
+        )
+
+    z_min = float(coords.min())
+    z_max = float(coords.max())
+    thickness = max(z_max - z_min, 0.0)
+    vacuum = max(axis_len - thickness, 0.0)
+    center = 0.5 * (z_max + z_min)
+    target_center = float(slab_center) * axis_len
+    center_offset = abs(center - target_center)
+
+    reason = None
+    valid = True
+
+    if max_layer_thickness is not None and max_layer_thickness > 0:
+        if thickness > max_layer_thickness + tol:
+            valid = False
+            reason = f"layer thickness {thickness:.3f}Å exceeds limit {max_layer_thickness:.3f}Å"
+
+    if valid and min_vacuum_thickness is not None and min_vacuum_thickness > 0:
+        if vacuum < max(0.0, min_vacuum_thickness - tol):
+            valid = False
+            reason = f"vacuum {vacuum:.3f}Å < required {min_vacuum_thickness:.3f}Å"
+
+    if valid and slab_center_tol is not None and slab_center_tol >= 0 and axis_len > 0:
+        tol_abs = slab_center_tol
+        if slab_center_tol <= 1.0:
+            tol_abs = slab_center_tol * axis_len
+        if center_offset > tol_abs + tol:
+            valid = False
+            reason = (
+                f"slab center offset {center_offset:.3f}Å exceeds tolerance {tol_abs:.3f}Å along axis {axis_index}"
+            )
+
+    return SlabValidationResult(
+        valid=valid,
+        reason=reason,
+        axis_index=axis_index,
+        axis_length=axis_len,
+        layer_bounds=(z_min, z_max),
+        layer_thickness=thickness,
+        vacuum_length=vacuum,
+        center_offset=center_offset,
+    )
+
+
 def squash_layer_thickness(struct: Structure,
                            max_thickness: float,
                            axis_index: int = 2,
@@ -1733,6 +1810,7 @@ class SlabProjector:
         self.layer_thickness_max = float(getattr(args, "layer_thickness_max", 0.0))
         self.surface_frac = float(getattr(args, "surface_frac", 0.25))
         self.slab_center = float(getattr(args, "slab_center", 0.5))
+        self.slab_center_tol = float(getattr(args, "slab_center_tol", 0.05))
 
     def project(self, struct: Structure, with_metrics: bool = False):
         st = orthogonalize_lattice_to_axis(struct, axis_index=self.axis_index)
@@ -1778,6 +1856,16 @@ class SlabProjector:
             "vacuum_gap": self.vacuum_target,
             "axis_length_total": total_axis,
         })
+        slab_validation = validate_slab_geometry(
+            st,
+            axis_index=self.axis_index,
+            max_layer_thickness=target_layer,
+            min_vacuum_thickness=self.vacuum_target,
+            slab_center=self.slab_center,
+            slab_center_tol=self.slab_center_tol,
+        )
+        metrics["slab_validation"] = asdict(slab_validation)
+        metrics["slab_valid"] = slab_validation.valid
         if not with_metrics:
             metrics = {}
         return st, metrics
@@ -1804,6 +1892,13 @@ class CandidatePreprocessor:
             "checked_sites": 0,
         }
         metrics["motif_check_passed"] = metrics["motif_check"]["passed"]
+
+        if not metrics.get("slab_valid", True):
+            reason = "slab_validation_failed"
+            slab_meta = metrics.get("slab_validation") or {}
+            if isinstance(slab_meta, dict) and slab_meta.get("reason"):
+                reason = slab_meta["reason"]
+            return PreprocessResult(False, struct=st, reason=reason, metrics=metrics)
 
         if self.args.layer_thickness_max > 0 and metrics.get("z_thickness", 0.0) > self.args.layer_thickness_max + 1e-3:
             return PreprocessResult(False, struct=st, reason=(
@@ -2343,6 +2438,13 @@ class CandidateEvaluator:
             env_summary = env_report.to_metrics()
             if not env_report.ok:
                 return EvaluatorResult(False, reason=f"local_env: {env_report.reason}")
+
+        local_env_metrics = None
+        if self.local_env_checker:
+            env_ok, env_metrics, env_reason = self.local_env_checker.check(struct)
+            local_env_metrics = env_metrics
+            if not env_ok:
+                return EvaluatorResult(False, reason=env_reason or "local_env 检查失败")
 
         local_env_metrics = None
         if self.local_env_checker:
