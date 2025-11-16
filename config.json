@@ -8,6 +8,25 @@
     "cn_target": 4,
     "cn_range": [3, 6],
 
+    "local_env_constraints": {
+      "defaults": {
+        "cn_range": [3, 6],
+        "threshold": 0.7,
+        "preferred_motifs": ["tetrahedral", "trigonal pyramidal"]
+      },
+      "elements": {
+        "Ga": {
+          "cn_range": [4, 4],
+          "preferred_motifs": ["tetrahedral"]
+        },
+        "Sb": {
+          "cn_range": [3, 4],
+          "preferred_motifs": ["trigonal pyramidal", "tetrahedral"],
+          "threshold": 0.65
+        }
+      }
+    },
+
     "vacuum_thickness": 20.0,
     "vacuum_buffer": 1.0,
     "layer_axis": "c",
