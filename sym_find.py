@@ -424,6 +424,14 @@ def load_settings(config_path: str) -> argparse.Namespace:
         settings = cfg
 
     # 默认值
+    filter_defaults = {
+        "enable_min_distance_filter": True,
+        "min_interatomic_distance": 1.2,
+        "enable_vacuum_filter": True,
+        "min_vacuum_thickness": 8.0,
+        "vacuum_axis": "c",
+    }
+
     defaults = {
         "outdir": "out",
 
@@ -499,10 +507,14 @@ def load_settings(config_path: str) -> argparse.Namespace:
         # target SG selection（None 表示自动）
         "target_sgs": 26,
         "exclude_sgs": [],
+
+        "filters": filter_defaults,
     }
 
     # 合并默认和用户设置
-    params = {**defaults, **settings}
+    settings_filters = settings.get("filters", {}) if isinstance(settings, dict) else {}
+    params = {**defaults, **{k: v for k, v in settings.items() if k != "filters"}}
+    params["filters"] = {**filter_defaults, **settings_filters}
 
     # 规范类型
     # symprec: 列表
@@ -681,6 +693,98 @@ def min_image_vec(frac_delta):
     d = np.array(frac_delta, dtype=float)
     d -= np.round(d)
     return d
+
+
+def has_too_close_atoms(structure: Structure, min_distance: float):
+    """Return whether any interatomic distance is smaller than *min_distance*."""
+
+    if min_distance is None:
+        return False, []
+
+    lattice = structure.lattice
+    frac = np.array([site.frac_coords for site in structure.sites])
+    n = len(frac)
+    details: List[str] = []
+    has_close = False
+    if n <= 1:
+        return False, details
+
+    min_distance = float(min_distance)
+    for i in range(n):
+        for j in range(i + 1, n):
+            df = min_image_vec(frac[j] - frac[i])
+            dist = float(np.linalg.norm(df @ lattice.matrix))
+            if dist < min_distance - 1e-8:
+                has_close = True
+                details.append(f"site {i} - site {j}: {dist:.2f} Å < {min_distance:.2f} Å")
+    return has_close, details
+
+
+def _fractional_span(frac_coords: np.ndarray) -> float:
+    if frac_coords.size == 0:
+        return 0.0
+    coords = np.sort(np.mod(frac_coords, 1.0))
+    if len(coords) == 1:
+        return 0.0
+    gaps = np.diff(coords)
+    wrap_gap = (coords[0] + 1.0) - coords[-1]
+    max_gap = float(wrap_gap)
+    if gaps.size:
+        max_gap = max(max_gap, float(np.max(gaps)))
+    span = 1.0 - max_gap
+    return max(0.0, min(1.0, span))
+
+
+def has_sufficient_vacuum(structure: Structure,
+                          min_vacuum_thickness: float,
+                          vacuum_axis: str = "c"):
+    axis_idx = axis_to_index(vacuum_axis)
+    axis_label = axis_index_to_label(axis_idx)
+    lattice = structure.lattice
+    axis_lengths = lattice.abc
+    L_axis = float(axis_lengths[axis_idx])
+    if L_axis <= 0:
+        detail = f"vacuum along {axis_label}: invalid lattice length {L_axis:.3f} Å"
+        return False, 0.0, detail
+
+    frac_coords = np.array([site.frac_coords[axis_idx] for site in structure.sites], dtype=float)
+    occupy_span = _fractional_span(frac_coords)
+    occupied_thickness = occupy_span * L_axis
+    vacuum_thickness = max(0.0, L_axis - occupied_thickness)
+
+    if vacuum_thickness + 1e-8 < float(min_vacuum_thickness):
+        detail = (f"vacuum along {axis_label}: {vacuum_thickness:.2f} Å "
+                  f"(min required {min_vacuum_thickness:.2f} Å)")
+        return False, vacuum_thickness, detail
+
+    detail = (f"vacuum along {axis_label}: {vacuum_thickness:.2f} Å "
+              f">= {min_vacuum_thickness:.2f} Å")
+    return True, vacuum_thickness, detail
+
+
+def is_structure_valid(structure: Structure, filters: Optional[Dict[str, object]] = None):
+    """Run fast structural filters before expensive evaluations."""
+
+    filters = filters or {}
+    try:
+        if filters.get("enable_min_distance_filter", True):
+            min_dist = filters.get("min_interatomic_distance", 1.2)
+            has_close, close_details = has_too_close_atoms(structure, float(min_dist))
+            if has_close:
+                reason = "atoms too close: " + "; ".join(close_details[:3])
+                return False, reason
+
+        if filters.get("enable_vacuum_filter", True):
+            min_vac = float(filters.get("min_vacuum_thickness", 8.0))
+            axis = filters.get("vacuum_axis", "c")
+            has_vacuum, vac_thickness, vac_detail = has_sufficient_vacuum(structure, min_vac, axis)
+            if not has_vacuum:
+                reason = "no sufficient vacuum: " + vac_detail
+                return False, reason
+    except Exception as exc:
+        return False, f"filter failure: {exc}"
+
+    return True, None
 
 
 def get_species_indices(struct: Structure):
@@ -1748,8 +1852,14 @@ def main():
                 append_log(log_path, f"[FAIL] det={det2}  pyxtal 采样均失败")
                 continue
 
-            for st_raw in cands:
+            for cand_idx, st_raw in enumerate(cands, 1):
                 debug_save(st_raw, det2, 1.0, "raw")
+
+                is_valid, reason = is_structure_valid(st_raw, args.filters)
+                if not is_valid:
+                    append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  {reason}")
+                    debug_save(st_raw, det2, 1.0, "filter_fail")
+                    continue
 
                 pre_res = preprocessor.preprocess(st_raw)
                 if not pre_res.ok:

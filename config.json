@@ -56,6 +56,14 @@
 
     "debug_save_all_cands": true,
     "debug_save_rejected": true,
-    "debug_max_per_sg": 30
+    "debug_max_per_sg": 30,
+
+    "filters": {
+      "enable_min_distance_filter": true,
+      "min_interatomic_distance": 1.2,
+      "enable_vacuum_filter": true,
+      "min_vacuum_thickness": 8.0,
+      "vacuum_axis": "c"
+    }
   }
 }
