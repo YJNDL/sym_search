@@ -47,14 +47,15 @@ import argparse
 import random
 import traceback
 from collections import defaultdict, Counter
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
 
 from pymatgen.core import Structure, Lattice
 from pymatgen.core.periodic_table import Element
 from pymatgen.analysis.structure_matcher import StructureMatcher
+from pymatgen.analysis.local_env import CrystalNN, LocalStructOrderParams
 from pymatgen.io.cif import CifWriter
 from pymatgen.io.vasp import Poscar
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
@@ -179,6 +180,41 @@ class EvaluatorResult:
     primitive: Optional[Structure] = None
     meta: Optional[dict] = None
     reason: Optional[str] = None
+
+
+@dataclass
+class SlabValidationResult:
+    """Outcome bundle for slab-geometry validation checks."""
+
+    valid: bool
+    reason: Optional[str] = None
+    axis_index: int = 2
+    axis_length: float = 0.0
+    layer_bounds: Tuple[float, float] = (0.0, 0.0)
+    layer_thickness: float = 0.0
+    vacuum_length: float = 0.0
+    center_offset: float = 0.0
+
+
+@dataclass
+class LocalEnvRule:
+    """Element-specific motif / CN bounds used by the LocalEnv checker."""
+
+    cn_range: Tuple[float, float]
+    motifs: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LocalEnvConfig:
+    """Normalized configuration bundle for local environment constraints."""
+
+    enabled: bool = False
+    threshold: float = 0.65
+    default_motifs: List[str] = field(default_factory=list)
+    global_cn_range: Tuple[float, float] = (0.0, 1000.0)
+    species_subset: Set[str] = field(default_factory=set)
+    element_rules: Dict[str, LocalEnvRule] = field(default_factory=dict)
+    crystalnn_kwargs: Dict[str, object] = field(default_factory=dict)
 
 
 class GeometryConstraints:
@@ -344,6 +380,187 @@ def motif_overlap_report(struct: Structure,
     return bool(overlaps), {"overlaps": overlaps, "motif_count": len(centers)}
 
 
+_LSOP_SUPPORTED_TYPES = tuple(LocalStructOrderParams._LocalStructOrderParams__supported_types)
+
+
+def _normalize_motif_token(text: str) -> str:
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+_MOTIF_SYNONYMS = {
+    "tetrahedral": "tet",
+    "tetrahedron": "tet",
+    "tetrahedralcn": "tet",
+    "squareplanar": "sq_plan",
+    "squarecoplanar": "sq_plan",
+    "squareplanarcn": "sq_plan",
+    "octahedral": "oct",
+    "octahedron": "oct",
+    "octahedralcn": "oct",
+    "trigonalplanar": "tri_plan",
+    "trigonalplanarcn": "tri_plan",
+    "trigonalpyramidal": "tri_pyr",
+    "trigonalpyramidalcn": "tri_pyr",
+    "trigonalbipyramidal": "tri_bipyr",
+    "trigonalbipyramidalcn": "tri_bipyr",
+    "squarepyramidal": "sq_pyr",
+    "squarebipyramidal": "sq_bipyr",
+    "rectangularseesawlike": "see_saw_rect",
+    "rectangularseesaw": "see_saw_rect",
+    "seesawlike": "see_saw_rect",
+    "seesaw": "see_saw_rect",
+    "pentagonalplanar": "pent_plan",
+    "pentagonalplanarcn": "pent_plan",
+    "pentagonalpyramidal": "pent_pyr",
+    "pentagonalbipyramidal": "pent_bipyr",
+    "hexagonalpyramidal": "hex_pyr",
+    "hexagonalbipyramidal": "hex_bipyr",
+    "cuboctahedral": "cuboct",
+    "cuboctahedron": "cuboct",
+}
+
+
+def canonicalize_motif_name(name: str) -> str:
+    if not isinstance(name, str):
+        raise ValueError(f"motif 类型必须是字符串，收到 {name!r}")
+    token = name.strip()
+    if not token:
+        raise ValueError("motif 类型不能为空字符串")
+    if token in _LSOP_SUPPORTED_TYPES:
+        return token
+    norm = _normalize_motif_token(token)
+    if not norm:
+        raise ValueError("motif 类型不能为空白字符")
+    if norm in _MOTIF_SYNONYMS:
+        mapped = _MOTIF_SYNONYMS[norm]
+        if mapped not in _LSOP_SUPPORTED_TYPES:
+            raise ValueError(f"motif {name!r} 映射为 {mapped!r} 但该类型不被 LocalStructOrderParams 支持")
+        return mapped
+    for supported in _LSOP_SUPPORTED_TYPES:
+        if norm == _normalize_motif_token(supported):
+            return supported
+    raise ValueError(
+        "motif 类型不受支持: {} (支持: {})".format(
+            name,
+            ", ".join(sorted(_LSOP_SUPPORTED_TYPES)),
+        )
+    )
+
+
+class MotifReasonablenessChecker:
+    """Validate local motifs using CrystalNN + LocalStructOrderParams."""
+
+    def __init__(self, config: Optional[Dict[str, object]] = None):
+        cfg = dict(config or {})
+        motifs_raw = cfg.get("motifs") or []
+        motifs_clean: List[str] = []
+        for motif in motifs_raw:
+            text = str(motif).strip()
+            if not text:
+                continue
+            canonical = canonicalize_motif_name(text)
+            if canonical not in motifs_clean:
+                motifs_clean.append(canonical)
+        threshold = cfg.get("threshold", 0.55)
+        species_raw = cfg.get("species") or []
+        species = {str(s).strip().lower() for s in species_raw if str(s).strip()}
+        enabled_flag = cfg.get("enabled", bool(motifs_clean))
+        self.motifs: List[str] = motifs_clean
+        self.threshold = float(threshold)
+        self.species_filter = species
+        self.enabled = bool(motifs_clean) and as_bool(enabled_flag)
+        nn_kwargs = cfg.get("crystalnn_kwargs") or {}
+        if not isinstance(nn_kwargs, dict):
+            nn_kwargs = {}
+        self._nn_kwargs = dict(nn_kwargs)
+        self._nn: Optional[CrystalNN] = CrystalNN(**self._nn_kwargs) if self.enabled else None
+        self._lop: Optional[LocalStructOrderParams] = (
+            LocalStructOrderParams(self.motifs) if self.enabled else None
+        )
+
+    def check(self, struct: Structure):
+        metrics: Dict[str, object] = {
+            "enabled": self.enabled,
+            "motifs": list(self.motifs),
+            "threshold": self.threshold,
+            "species_subset": sorted(self.species_filter) if self.species_filter else None,
+        }
+        if not self.enabled:
+            metrics.update({"passed": True, "checked_sites": 0, "motif_counts": {}, "failed_sites": []})
+            return True, metrics, None
+
+        if self._nn is None or self._lop is None:
+            metrics.update({"passed": False, "checked_sites": 0})
+            return False, metrics, "motif_checker 未初始化"
+
+        checked = 0
+        failing: List[Dict[str, object]] = []
+        motif_counts: Counter = Counter()
+        best_scores: List[float] = []
+        first_reason: Optional[str] = None
+
+        for idx, site in enumerate(struct.sites):
+            if self.species_filter and site.species_string.lower() not in self.species_filter:
+                continue
+            checked += 1
+            try:
+                nn_info = self._nn.get_nn_info(struct, idx)
+            except Exception as exc:  # pragma: no cover
+                metrics.update({"passed": False, "checked_sites": checked, "error": str(exc)})
+                return False, metrics, f"CrystalNN 失败: {exc}"
+            neigh_indices = [info.get("site_index") for info in nn_info if info.get("site_index") is not None]
+            if not neigh_indices:
+                failing.append({"index": idx, "species": site.species_string, "reason": "no_neighbors"})
+                if not first_reason:
+                    first_reason = f"site #{idx} {site.species_string} 未找到 CrystalNN 邻居"
+                continue
+            try:
+                ops = self._lop.get_order_parameters(struct, idx, indices_neighs=[int(i) for i in neigh_indices])
+            except Exception as exc:  # pragma: no cover
+                metrics.update({"passed": False, "checked_sites": checked, "error": str(exc)})
+                return False, metrics, f"LocalStructOrderParams 失败: {exc}"
+            best_idx = None
+            best_val: Optional[float] = None
+            for mot_idx, val in enumerate(ops):
+                if val is None:
+                    continue
+                val_f = float(val)
+                if best_val is None or val_f > best_val:
+                    best_val = val_f
+                    best_idx = mot_idx
+            if best_val is not None:
+                best_scores.append(best_val)
+            if best_val is not None and best_val >= self.threshold:
+                if best_idx is not None and 0 <= best_idx < len(self.motifs):
+                    motif_counts[self.motifs[best_idx]] += 1
+                continue
+            failing.append({
+                "index": idx,
+                "species": site.species_string,
+                "best_score": best_val,
+                "best_motif": self.motifs[best_idx] if best_idx is not None and 0 <= best_idx < len(self.motifs) else None,
+            })
+            if not first_reason:
+                score_txt = "None" if best_val is None else f"{best_val:.3f}"
+                first_reason = (
+                    f"motif 检查失败: site #{idx} {site.species_string} 分数 {score_txt} < 阈值 {self.threshold:.2f}"
+                )
+
+        metrics.update({
+            "checked_sites": checked,
+            "motif_counts": dict(motif_counts),
+            "failed_sites": failing[:5],
+        })
+        if best_scores:
+            metrics["best_score_min"] = min(best_scores)
+            metrics["best_score_median"] = float(np.median(best_scores))
+        passed = checked == 0 or not failing
+        metrics["passed"] = passed
+        if passed:
+            return True, metrics, None
+        return False, metrics, first_reason or "motif 检查失败"
+
+
 # ------------------------------ 从 config.json 读取 settings ------------------------------
 
 def parse_sg_list(value):
@@ -464,6 +681,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "layer_thickness_max": 3.0,
         "layer_axis": "c",
         "slab_center": 0.5,
+        "slab_center_tol": 0.05,
         "reslab_after_relax": True,
 
         # 用于最近邻统计和 CN 的元素对（可以改成任意中心/邻居元素）
@@ -477,6 +695,17 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "debug_save_all_cands": False,   # 保存所有 pyxtal 生成的候选
         "debug_save_rejected": False,    #（预留，目前未单独区分）
         "debug_max_per_sg": 50,
+
+        # motif 合理性检查（CrystalNN + LocalStructOrderParams）
+        "motif_checker": {
+            "enabled": False,
+            "motifs": [],
+            "threshold": 0.55,
+            "species": [],
+            "crystalnn_kwargs": {},
+        },
+
+        "local_env_constraints": {},
 
         # 键长目标区间（Å）
         "bond_target_min": 2.2,
@@ -503,6 +732,34 @@ def load_settings(config_path: str) -> argparse.Namespace:
 
     # 合并默认和用户设置
     params = {**defaults, **settings}
+
+    motif_defaults = defaults.get("motif_checker", {})
+    user_motif_raw = settings.get("motif_checker")
+    if user_motif_raw is not None and not isinstance(user_motif_raw, dict):
+        raise TypeError("motif_checker 需为对象，例如 {\"motifs\": [\"tet\"]}")
+    user_motif = user_motif_raw if isinstance(user_motif_raw, dict) else None
+    motif_cfg = {**motif_defaults}
+    if user_motif:
+        motif_cfg.update(user_motif)
+    species_val = motif_cfg.get("species")
+    if species_val is None:
+        motif_cfg["species"] = []
+    else:
+        motif_cfg["species"] = [str(s) for s in species_val]
+    motifs_val = motif_cfg.get("motifs")
+    if motifs_val is None:
+        motif_cfg["motifs"] = []
+    else:
+        motif_cfg["motifs"] = [str(m) for m in motifs_val]
+    params["motif_checker"] = motif_cfg
+
+    lec_raw = settings.get("local_env_constraints")
+    if lec_raw is None:
+        params["local_env_constraints"] = {}
+    else:
+        if not isinstance(lec_raw, dict):
+            raise TypeError("local_env_constraints 需为对象，例如 {\"elements\": {\"Ga\": {...}}}")
+        params["local_env_constraints"] = dict(lec_raw)
 
     # 规范类型
     # symprec: 列表
@@ -551,6 +808,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
     params["surface_frac"] = float(params["surface_frac"])
     params["layer_axis"] = str(params.get("layer_axis", "c"))
     params["layer_axis_index"] = axis_to_index(params["layer_axis"])
+    params["slab_center_tol"] = float(params.get("slab_center_tol", 0.05))
     params["reslab_after_relax"] = as_bool(params.get("reslab_after_relax", True))
 
     params["bond_scaling_mode"] = str(params.get("bond_scaling_mode", "soft")).lower()
@@ -583,6 +841,123 @@ def load_settings(config_path: str) -> argparse.Namespace:
     params["exclude_sgs"] = excl if excl is not None else []
 
     return argparse.Namespace(**params)
+
+
+def _parse_cn_range(value, fallback: Optional[Sequence[float]] = None) -> Tuple[float, float]:
+    """Return a normalized CN window from various config inputs."""
+
+    if value is None:
+        if fallback is None:
+            return 0.0, 1000.0
+        if isinstance(fallback, (list, tuple)) and len(fallback) == 2:
+            lo, hi = fallback
+        else:
+            raise ValueError(f"cn_range 兜底必须包含两个数值，收到 {fallback!r}")
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        lo, hi = value
+    elif isinstance(value, str) and "," in value:
+        lo, hi = value.split(",", 1)
+    else:
+        raise ValueError(f"cn_range 需包含两个数值，收到 {value!r}")
+    lo_f = float(lo)
+    hi_f = float(hi)
+    if lo_f > hi_f:
+        lo_f, hi_f = hi_f, lo_f
+    return lo_f, hi_f
+
+
+def _canonicalize_motif_list(raw) -> List[str]:
+    motifs: List[str] = []
+    if not raw:
+        return motifs
+    for token in raw:
+        if token is None:
+            continue
+        name = str(token).strip()
+        if not name:
+            continue
+        canonical = canonicalize_motif_name(name)
+        if canonical not in motifs:
+            motifs.append(canonical)
+    return motifs
+
+
+def build_local_env_config(args: argparse.Namespace) -> LocalEnvConfig:
+    """Merge JSON/CLI fields into a single LocalEnvConfig object."""
+
+    raw_cfg = dict(getattr(args, "local_env_constraints", {}) or {})
+    global_cn_range = _parse_cn_range(
+        raw_cfg.get("global_cn_range"),
+        getattr(args, "cn_range", None),
+    )
+    default_motifs = _canonicalize_motif_list(
+        raw_cfg.get("default_motifs")
+        or raw_cfg.get("motifs")
+        or raw_cfg.get("preferred_motifs")
+    )
+    species_tokens = raw_cfg.get("species_subset") or raw_cfg.get("species") or []
+    species_subset = {
+        str(token).strip().lower()
+        for token in species_tokens
+        if str(token).strip()
+    }
+    nn_kwargs = raw_cfg.get("crystalnn_kwargs") or {}
+    if not isinstance(nn_kwargs, dict):
+        raise TypeError("local_env_constraints.crystalnn_kwargs 需为对象")
+
+    element_rules: Dict[str, LocalEnvRule] = {}
+
+    def _register_rule(elem: str,
+                       cn_range: Optional[Sequence[float]] = None,
+                       motifs: Optional[List[str]] = None):
+        if elem is None:
+            return
+        key = str(elem).strip()
+        if not key:
+            return
+        cn_rng = _parse_cn_range(cn_range, global_cn_range)
+        motif_list = motifs if motifs else list(default_motifs)
+        element_rules[key.lower()] = LocalEnvRule(cn_range=cn_rng, motifs=motif_list)
+
+    legacy_elements = raw_cfg.get("elements") or {}
+    if legacy_elements and not isinstance(legacy_elements, dict):
+        raise TypeError("local_env_constraints.elements 需为 {symbol: {...}} 格式")
+    for elem, elem_cfg in legacy_elements.items():
+        elem_dict = dict(elem_cfg or {})
+        cn_rng = elem_dict.get("cn_range")
+        motifs = _canonicalize_motif_list(
+            elem_dict.get("preferred_motifs")
+            or elem_dict.get("motifs")
+            or elem_dict.get("default_motifs")
+        )
+        _register_rule(elem, cn_range=cn_rng, motifs=motifs or None)
+
+    cn_rules = raw_cfg.get("cn_rules") or {}
+    if cn_rules and not isinstance(cn_rules, dict):
+        raise TypeError("local_env_constraints.cn_rules 需为 {symbol: {...}} 格式")
+    for elem, rule_cfg in cn_rules.items():
+        rule_dict = dict(rule_cfg or {})
+        prefer_rng = rule_dict.get("preferred_range")
+        allowed_rng = rule_dict.get("allowed_range")
+        cn_rng = prefer_rng if prefer_rng is not None else allowed_rng
+        motifs = _canonicalize_motif_list(
+            rule_dict.get("preferred_motifs") or rule_dict.get("motifs")
+        )
+        _register_rule(elem, cn_range=cn_rng or allowed_rng, motifs=motifs or None)
+
+    enabled_default = bool(raw_cfg) and (bool(element_rules) or bool(default_motifs) or bool(species_subset))
+    enabled = as_bool(raw_cfg.get("enabled", enabled_default))
+    threshold = float(raw_cfg.get("threshold", 0.65))
+
+    return LocalEnvConfig(
+        enabled=enabled,
+        threshold=threshold,
+        default_motifs=list(default_motifs),
+        global_cn_range=global_cn_range,
+        species_subset=species_subset,
+        element_rules=element_rules,
+        crystalnn_kwargs=dict(nn_kwargs),
+    )
 
 
 # ------------------------------ 几何与邻接（通用元素版） ------------------------------
@@ -913,6 +1288,68 @@ def surface_corrugation_angstrom(struct: Structure,
     return max(corr_top, corr_bot), thickness
 
 
+def validate_slab_geometry(struct: Structure,
+                           axis_index: int = 2,
+                           max_layer_thickness: Optional[float] = None,
+                           min_vacuum_thickness: Optional[float] = None,
+                           slab_center: float = 0.5,
+                           slab_center_tol: float = 0.05,
+                           tol: float = 1e-3) -> SlabValidationResult:
+    """Check whether a structure respects the requested 2D slab constraints."""
+
+    axis_len = float(struct.lattice.lengths[axis_index])
+    coords = np.array([s.frac_coords[axis_index] * axis_len for s in struct.sites], dtype=float)
+    if coords.size == 0:
+        return SlabValidationResult(
+            valid=False,
+            reason="structure has no atoms",
+            axis_index=axis_index,
+            axis_length=axis_len,
+        )
+
+    z_min = float(coords.min())
+    z_max = float(coords.max())
+    thickness = max(z_max - z_min, 0.0)
+    vacuum = max(axis_len - thickness, 0.0)
+    center = 0.5 * (z_max + z_min)
+    target_center = float(slab_center) * axis_len
+    center_offset = abs(center - target_center)
+
+    reason = None
+    valid = True
+
+    if max_layer_thickness is not None and max_layer_thickness > 0:
+        if thickness > max_layer_thickness + tol:
+            valid = False
+            reason = f"layer thickness {thickness:.3f}Å exceeds limit {max_layer_thickness:.3f}Å"
+
+    if valid and min_vacuum_thickness is not None and min_vacuum_thickness > 0:
+        if vacuum < max(0.0, min_vacuum_thickness - tol):
+            valid = False
+            reason = f"vacuum {vacuum:.3f}Å < required {min_vacuum_thickness:.3f}Å"
+
+    if valid and slab_center_tol is not None and slab_center_tol >= 0 and axis_len > 0:
+        tol_abs = slab_center_tol
+        if slab_center_tol <= 1.0:
+            tol_abs = slab_center_tol * axis_len
+        if center_offset > tol_abs + tol:
+            valid = False
+            reason = (
+                f"slab center offset {center_offset:.3f}Å exceeds tolerance {tol_abs:.3f}Å along axis {axis_index}"
+            )
+
+    return SlabValidationResult(
+        valid=valid,
+        reason=reason,
+        axis_index=axis_index,
+        axis_length=axis_len,
+        layer_bounds=(z_min, z_max),
+        layer_thickness=thickness,
+        vacuum_length=vacuum,
+        center_offset=center_offset,
+    )
+
+
 def squash_layer_thickness(struct: Structure,
                            max_thickness: float,
                            axis_index: int = 2,
@@ -1146,6 +1583,7 @@ class SlabProjector:
         self.layer_thickness_max = float(getattr(args, "layer_thickness_max", 0.0))
         self.surface_frac = float(getattr(args, "surface_frac", 0.25))
         self.slab_center = float(getattr(args, "slab_center", 0.5))
+        self.slab_center_tol = float(getattr(args, "slab_center_tol", 0.05))
 
     def project(self, struct: Structure, with_metrics: bool = False):
         st = orthogonalize_lattice_to_axis(struct, axis_index=self.axis_index)
@@ -1191,20 +1629,49 @@ class SlabProjector:
             "vacuum_gap": self.vacuum_target,
             "axis_length_total": total_axis,
         })
+        slab_validation = validate_slab_geometry(
+            st,
+            axis_index=self.axis_index,
+            max_layer_thickness=target_layer,
+            min_vacuum_thickness=self.vacuum_target,
+            slab_center=self.slab_center,
+            slab_center_tol=self.slab_center_tol,
+        )
+        metrics["slab_validation"] = asdict(slab_validation)
+        metrics["slab_valid"] = slab_validation.valid
         if not with_metrics:
             metrics = {}
         return st, metrics
 
 
 class CandidatePreprocessor:
-    def __init__(self, args, projector: SlabProjector, constraints: GeometryConstraints):
+    def __init__(self,
+                 args,
+                 projector: SlabProjector,
+                 constraints: GeometryConstraints,
+                 motif_checker: Optional[MotifReasonablenessChecker] = None):
         self.args = args
         self.projector = projector
         self.constraints = constraints
+        self.motif_checker = motif_checker
+        self._motif_required = bool(motif_checker and motif_checker.enabled)
 
     def preprocess(self, struct: Structure) -> PreprocessResult:
         st, slab_metrics = self.projector.project(struct, with_metrics=True)
         metrics: Dict[str, object] = dict(slab_metrics)
+        metrics["motif_check"] = {
+            "enabled": self._motif_required,
+            "passed": not self._motif_required,
+            "checked_sites": 0,
+        }
+        metrics["motif_check_passed"] = metrics["motif_check"]["passed"]
+
+        if not metrics.get("slab_valid", True):
+            reason = "slab_validation_failed"
+            slab_meta = metrics.get("slab_validation") or {}
+            if isinstance(slab_meta, dict) and slab_meta.get("reason"):
+                reason = slab_meta["reason"]
+            return PreprocessResult(False, struct=st, reason=reason, metrics=metrics)
 
         if self.args.layer_thickness_max > 0 and metrics.get("z_thickness", 0.0) > self.args.layer_thickness_max + 1e-3:
             return PreprocessResult(False, struct=st, reason=(
@@ -1248,6 +1715,9 @@ class CandidatePreprocessor:
                     reason=self._pair_violation_reason(report.violations[0]),
                     metrics=metrics,
                 )
+            motif_ok, motif_reason = self._run_motif_check(st, metrics)
+            if not motif_ok:
+                return PreprocessResult(False, struct=st, reason=motif_reason, metrics=metrics)
             return PreprocessResult(True, struct=st, scale_ab=1.0, metrics=metrics)
 
         ok, scaled, scale, extra_metrics, reason = self._apply_scaling(st, cand_d)
@@ -1255,7 +1725,194 @@ class CandidatePreprocessor:
             return PreprocessResult(False, struct=st, reason=reason, metrics=metrics)
 
         metrics.update(extra_metrics)
+        motif_ok, motif_reason = self._run_motif_check(scaled, metrics)
+        if not motif_ok:
+            return PreprocessResult(False, struct=scaled, reason=motif_reason, metrics=metrics)
         return PreprocessResult(True, struct=scaled, scale_ab=scale, metrics=metrics)
+
+    def _run_motif_check(self, struct: Structure, metrics: Dict[str, object]):
+        if not self._motif_required:
+            metrics["motif_check"] = {
+                "enabled": False,
+                "passed": True,
+                "checked_sites": 0,
+            }
+            metrics["motif_check_passed"] = True
+            return True, None
+        if not self.motif_checker:
+            metrics["motif_check"] = {"enabled": True, "passed": False, "checked_sites": 0}
+            metrics["motif_check_passed"] = False
+            return False, "motif_checker 未初始化"
+        ok, motif_metrics, reason = self.motif_checker.check(struct)
+        metrics["motif_check"] = motif_metrics
+        metrics["motif_check_passed"] = motif_metrics.get("passed", ok)
+        if ok:
+            return True, None
+        return False, reason or "motif 检查失败"
+
+
+class LocalEnvConstraintChecker:
+    """Element-aware CrystalNN + motif constraints inspired by aimd_env_tracker."""
+
+    def __init__(self, config: Optional[LocalEnvConfig] = None):
+        cfg = config or LocalEnvConfig()
+        self.enabled = bool(cfg.enabled)
+        self.threshold = float(cfg.threshold)
+        self.global_cn_range = (
+            float(cfg.global_cn_range[0]),
+            float(cfg.global_cn_range[1]),
+        )
+        self.species_filter = {s.lower() for s in cfg.species_subset if s}
+        self._nn_kwargs = dict(cfg.crystalnn_kwargs or {})
+        elements_cfg = {}
+        motif_pool = set(cfg.default_motifs)
+        for elem_key, rule in (cfg.element_rules or {}).items():
+            if not elem_key:
+                continue
+            motifs = list(rule.motifs)
+            if not motifs:
+                motifs = list(cfg.default_motifs)
+            motif_pool.update(motifs)
+            cn_range = (
+                float(rule.cn_range[0]),
+                float(rule.cn_range[1]),
+            )
+            elements_cfg[elem_key.lower()] = {
+                "cn_range": cn_range,
+                "motifs": motifs,
+            }
+        self.element_rules = elements_cfg
+        self.default_rule = {
+            "cn_range": self.global_cn_range,
+            "motifs": list(cfg.default_motifs),
+        }
+        self._motif_list = sorted(motif_pool)
+        self._motif_index = {name: idx for idx, name in enumerate(self._motif_list)}
+        self._nn: Optional[CrystalNN] = None
+        self._lop: Optional[LocalStructOrderParams] = None
+        if self.enabled:
+            self._nn = CrystalNN(**self._nn_kwargs)
+            if self._motif_list:
+                self._lop = LocalStructOrderParams(self._motif_list)
+
+    def check(self, struct: Structure):
+        metrics: Dict[str, object] = {
+            "enabled": self.enabled,
+            "threshold": self.threshold,
+            "global_cn_range": self.global_cn_range,
+            "species_subset": sorted(self.species_filter) if self.species_filter else None,
+        }
+        if not self.enabled:
+            metrics.update({"passed": True, "checked_sites": 0, "failed_sites": []})
+            return True, metrics, None
+        if self._nn is None:
+            metrics.update({"passed": False, "checked_sites": 0})
+            return False, metrics, "local_env_checker 未初始化 CrystalNN"
+        checked = 0
+        failing: List[Dict[str, object]] = []
+        per_species: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for idx, site in enumerate(struct.sites):
+            specie = site.species_string
+            specie_key = specie.lower()
+            if self.species_filter and specie_key not in self.species_filter:
+                continue
+            rule = self.element_rules.get(specie_key, self.default_rule)
+            if rule is None:
+                continue
+            checked += 1
+            try:
+                cn_val = float(self._nn.get_cn(struct, idx))
+                nn_info = self._nn.get_nn_info(struct, idx)
+            except Exception as exc:  # pragma: no cover
+                metrics.update({"passed": False, "checked_sites": checked, "error": str(exc)})
+                return False, metrics, f"CrystalNN 失败: {exc}"
+            per_species[specie]["count"] += 1
+            cn_lo, cn_hi = rule["cn_range"]
+            if cn_val < cn_lo - 1e-6 or cn_val > cn_hi + 1e-6:
+                failing.append({
+                    "index": idx,
+                    "species": specie,
+                    "cn": cn_val,
+                    "cn_range": rule["cn_range"],
+                    "reason": "cn_out_of_range",
+                })
+                continue
+            per_species[specie]["cn_ok"] += 1
+            motifs = rule.get("motifs") or []
+            if not motifs:
+                continue
+            if self._lop is None:
+                failing.append({
+                    "index": idx,
+                    "species": specie,
+                    "reason": "motif_checker_disabled",
+                })
+                continue
+            neigh_indices = [info.get("site_index") for info in nn_info if info.get("site_index") is not None]
+            if not neigh_indices:
+                failing.append({
+                    "index": idx,
+                    "species": specie,
+                    "reason": "no_neighbors",
+                })
+                continue
+            try:
+                ops = self._lop.get_order_parameters(
+                    struct,
+                    idx,
+                    indices_neighs=[int(i) for i in neigh_indices],
+                )
+            except Exception as exc:  # pragma: no cover
+                metrics.update({"passed": False, "checked_sites": checked, "error": str(exc)})
+                return False, metrics, f"LocalStructOrderParams 失败: {exc}"
+            best_motif = None
+            best_score = None
+            for motif in motifs:
+                mot_idx = self._motif_index.get(motif)
+                if mot_idx is None or mot_idx >= len(ops):
+                    continue
+                score = ops[mot_idx]
+                if score is None:
+                    continue
+                val = float(score)
+                if best_score is None or val > best_score:
+                    best_score = val
+                    best_motif = motif
+            if best_score is None or best_score < self.threshold:
+                failing.append({
+                    "index": idx,
+                    "species": specie,
+                    "reason": "motif_score",
+                    "best_motif": best_motif,
+                    "best_score": best_score,
+                })
+                continue
+            per_species[specie]["motif_ok"] += 1
+
+        metrics.update({
+            "checked_sites": checked,
+            "failed_sites": failing[:10],
+            "per_species": {k: dict(v) for k, v in per_species.items()},
+        })
+        passed = checked == 0 or not failing
+        metrics["passed"] = passed
+        if passed:
+            return True, metrics, None
+        reason = "local_env 检查失败"
+        if failing:
+            first = failing[0]
+            if first.get("reason") == "cn_out_of_range":
+                reason = (
+                    f"site #{first['index']} {first['species']} CN={first['cn']:.2f}"
+                    f" 不在区间 [{first['cn_range'][0]:.1f}, {first['cn_range'][1]:.1f}]"
+                )
+            elif first.get("reason") == "motif_score":
+                score_txt = "None" if first.get("best_score") is None else f"{first['best_score']:.3f}"
+                reason = (
+                    f"site #{first['index']} {first['species']} motif 分数 {score_txt}"
+                    f" < 阈值 {self.threshold:.2f}"
+                )
+        return False, metrics, reason
 
     def _apply_scaling(self, struct: Structure, cand_d: np.ndarray):
         bond_min = self.args.bond_target_min
@@ -1479,13 +2136,20 @@ class CandidateEvaluator:
                  args,
                  ref_stats: dict,
                  symprecs: Sequence[float],
-                 cn_range: Tuple[int, int],
-                 projector: Optional[SlabProjector] = None):
+                 projector: Optional[SlabProjector] = None,
+                 local_env_config: Optional[LocalEnvConfig] = None,
+                 local_env_checker: Optional[LocalEnvConstraintChecker] = None):
         self.args = args
         self.ref_stats = ref_stats
         self.symprecs = tuple(symprecs)
-        self.cn_lo, self.cn_hi = cn_range
+        if local_env_config is not None:
+            cn_lo, cn_hi = local_env_config.global_cn_range
+        else:
+            cn_lo, cn_hi = _parse_cn_range(getattr(args, "cn_range", None), (0.0, 1000.0))
+        self.cn_lo, self.cn_hi = float(cn_lo), float(cn_hi)
         self.projector = projector
+        self.local_env_config = local_env_config
+        self.local_env_checker = local_env_checker
 
     def evaluate(self,
                  struct: Structure,
@@ -1509,6 +2173,13 @@ class CandidateEvaluator:
             return EvaluatorResult(False, reason="CN 统计为空")
         if not all(self.cn_lo <= cn <= self.cn_hi for cn in CNs):
             return EvaluatorResult(False, reason=f"CN={CNs} 超出 [{self.cn_lo}, {self.cn_hi}]")
+
+        local_env_metrics = None
+        if self.local_env_checker:
+            env_ok, env_metrics, env_reason = self.local_env_checker.check(struct)
+            local_env_metrics = env_metrics
+            if not env_ok:
+                return EvaluatorResult(False, reason=env_reason or "local_env 检查失败")
 
         ok_sg, sg_found, sym_used = verify_spacegroup_exact(
             struct,
@@ -1540,6 +2211,8 @@ class CandidateEvaluator:
             meta.update(slab_metrics)
         if "z_thickness" in meta and "z_ptp" not in meta:
             meta["z_ptp"] = meta["z_thickness"]
+        if local_env_metrics is not None:
+            meta["local_env"] = local_env_metrics
 
         return EvaluatorResult(True, primitive=prim, meta=meta)
 
@@ -1668,8 +2341,6 @@ def main():
     if not target_sgs:
         raise ValueError("目标空间群列表为空，请检查 target_sgs/exclude_sgs 设置。")
 
-    cn_lo, cn_hi = int(args.cn_range[0]), int(args.cn_range[1])
-
     # 基本信息：基胞里的元素计数（只算一次就行）
     idx_map_base = get_species_indices(base)
     center_key = args.center_species.lower()
@@ -1701,9 +2372,20 @@ def main():
 
     constraints = GeometryConstraints(args)
     generator = CandidateGenerator(args)
-    preprocessor = CandidatePreprocessor(args, slab_projector, constraints)
+    motif_checker = MotifReasonablenessChecker(getattr(args, "motif_checker", {}))
+    local_env_config = build_local_env_config(args)
+    args.local_env_config = local_env_config
+    local_env_checker = LocalEnvConstraintChecker(local_env_config)
+    preprocessor = CandidatePreprocessor(args, slab_projector, constraints, motif_checker=motif_checker)
     geom_filter = GeometryFilter(args, constraints, symprecs, slab_projector)
-    evaluator = CandidateEvaluator(args, ref_stats, symprecs, (cn_lo, cn_hi), projector=slab_projector)
+    evaluator = CandidateEvaluator(
+        args,
+        ref_stats,
+        symprecs,
+        projector=slab_projector,
+        local_env_config=local_env_config,
+        local_env_checker=local_env_checker,
+    )
 
     for idx, sg in enumerate(target_sgs, 1):
         sg_dir = makedirs(os.path.join(outdir, f"SG_{sg:03d}"))
@@ -1712,10 +2394,18 @@ def main():
 
         debug_dir = makedirs(os.path.join(sg_dir, "debug"))
         debug_counter = 0
+        motif_required = bool(motif_checker and motif_checker.enabled)
 
-        def debug_save(struct: Optional[Structure], det2: int, scale_ab: float, tag: str, accepted: bool = False):
+        def debug_save(struct: Optional[Structure],
+                       det2: int,
+                       scale_ab: float,
+                       tag: str,
+                       accepted: bool = False,
+                       motif_passed: Optional[bool] = None):
             nonlocal debug_counter
             if struct is None:
+                return
+            if motif_required and motif_passed is not True:
                 return
             if accepted:
                 should_save = args.debug_save_all_cands
@@ -1749,20 +2439,21 @@ def main():
                 continue
 
             for st_raw in cands:
-                debug_save(st_raw, det2, 1.0, "raw")
+                debug_save(st_raw, det2, 1.0, "raw", motif_passed=(not motif_required))
 
                 pre_res = preprocessor.preprocess(st_raw)
+                motif_passed = pre_res.metrics.get("motif_check_passed", not motif_required)
                 if not pre_res.ok:
                     append_log(log_path, f"[REJ][prep] det={det2}  {pre_res.reason}")
-                    debug_save(pre_res.struct or st_raw, det2, pre_res.scale_ab, "prep_fail")
+                    debug_save(pre_res.struct or st_raw, det2, pre_res.scale_ab, "prep_fail", motif_passed=motif_passed)
                     continue
 
-                debug_save(pre_res.struct, det2, pre_res.scale_ab, "prepped")
+                debug_save(pre_res.struct, det2, pre_res.scale_ab, "prepped", motif_passed=motif_passed)
 
                 filt_res = geom_filter.filter(pre_res.struct)
                 if not filt_res.ok:
                     append_log(log_path, f"[REJ][geom] det={det2}  {filt_res.reason}")
-                    debug_save(filt_res.struct or pre_res.struct, det2, pre_res.scale_ab, "geom_fail")
+                    debug_save(filt_res.struct or pre_res.struct, det2, pre_res.scale_ab, "geom_fail", motif_passed=motif_passed)
                     continue
 
                 combined_meta: Dict[str, object] = {}
@@ -1774,7 +2465,7 @@ def main():
                 eval_res = evaluator.evaluate(filt_res.struct, sg, det2, pre_res.scale_ab, combined_meta)
                 if not eval_res.ok:
                     append_log(log_path, f"[REJ][eval] det={det2}  {eval_res.reason}")
-                    debug_save(filt_res.struct, det2, pre_res.scale_ab, "eval_fail")
+                    debug_save(filt_res.struct, det2, pre_res.scale_ab, "eval_fail", motif_passed=motif_passed)
                     continue
 
                 prim = eval_res.primitive
@@ -1783,11 +2474,11 @@ def main():
                 is_dup = any(matchers[sg].fit(prim, item["primitive"]) for item in found)
                 if is_dup:
                     append_log(log_path, f"[SKIP] det={det2}  发现重复结构，跳过")
-                    debug_save(prim, det2, pre_res.scale_ab, "dup")
+                    debug_save(prim, det2, pre_res.scale_ab, "dup", motif_passed=motif_passed)
                     continue
 
                 found.append({"primitive": prim, "meta": meta})
-                debug_save(prim, det2, pre_res.scale_ab, "accepted", accepted=True)
+                debug_save(prim, det2, pre_res.scale_ab, "accepted", accepted=True, motif_passed=motif_passed)
 
         # 每个 SG 只保留 topk
         found = sorted(found, key=lambda x: (x["meta"]["cost"], -x["meta"]["dmin_any"]))[:args.topk]

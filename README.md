@@ -43,6 +43,7 @@
 最新版脚本把候选筛选流程拆成“生成 → 预处理 → 几何过滤 → 评分”四层：
 
 1. **预处理 (`CandidatePreprocessor`)**：套入真空层、压缩厚度，控制表面起伏，并按 `bond_target_min/max` 自动缩放 a/b。缩放后的结构会立刻套用 `min_pair_dist_matrix`/硬球半径，逐一检查所有元素对（Ga–Ga、Sb–Sb 等）的最小距离，若违反阈值直接在该阶段淘汰；若 `enable_bond_scaling=false`，仍会记录原始键长与最短原子间距。
+   - 若在 `settings.motif_checker` 中开启了 `MotifReasonablenessChecker`，每个指定元素都会用 CrystalNN 找最近邻，再用 `LocalStructOrderParams` 计算诸如 `"tet"`/`"oct"` 等 motif 的局部有序参数。只要任意 motif 的分数超过 `threshold` 就视为“合理排布”，否则在预处理阶段直接拒收。
 2. **几何过滤 (`GeometryFilter`)**：
    - 依据元素对的最小距离矩阵/原子半径进行硬球检查，可选 `post_gen_relax` 做快速硬球松弛。
    - 计算层密度、motif 包络（基于等价原子 & 硬球半径），若 `reject_if_overlap=true` 则直接丢弃重叠或过密结构。
@@ -55,6 +56,8 @@
 - `layer_thickness`：可选的“目标层厚”，一旦设置，所有候选都会被压缩/拉伸到该绝对厚度，再在其外侧追加 `vacuum_thickness` 指定的真空。若留空，则默认保留原始厚度，只在超过 `layer_thickness_max` 时才压缩。
 - `layer_thickness_max`：当 `layer_thickness` 未设置时，作为薄片厚度的上限。若希望只做重心对齐，可把该值设为 0 并单独调 `slab_center`。
 - `slab_center`：薄片在真空方向上的中心位置（分数坐标，默认 0.5，对应居中真空）。
+- `slab_center_tol`：控制薄片实际质心与目标 `slab_center` 的容差，默认 0.05（按轴长的 5% 计算）。也可以直接填写绝对 Å 值，一旦超出
+  即视为“非 2D”结构并在预处理阶段拒收。
 - `layer_axis`：指定哪条晶轴作为“法向 + 真空方向”（支持 `a/b/c` 或 `x/y/z`）。
 - `reslab_after_relax`：若开启硬球松弛，松弛后的结构也会自动重新投影回薄片，以防 3D bulk 重新出现。
 
@@ -73,6 +76,46 @@
 - `reject_if_overlap`：若设为 `false`，违规结构会进入 `post_gen_relax` 处理，只有修复失败才会被丢弃。
 - `density_range`：限制候选的总体密度（单位 g/cm³）。
 - `post_gen_relax`：可设置 `{"mode": "hard_sphere", "max_iter": 40, "step": 0.5}`，在几何过滤阶段对轻微重叠的原子进行硬球松弛。
+- `motif_checker`：基于 CrystalNN + `LocalStructOrderParams` 的 motif 合理性过滤。例如：
+  ```json
+  "motif_checker": {
+    "enabled": true,
+    "motifs": ["tet", "oct"],
+    "threshold": 0.6,
+    "species": ["Ga"],
+    "crystalnn_kwargs": {"distance_cutoffs": null}
+  }
+  ```
+  - `motifs` 列表支持 `LocalStructOrderParams` 的类型（如 `tet`, `oct`, `sq_plan` 等），脚本会对每个受检原子取分数最高的 motif，与 `threshold` 比较。
+  - `species` 用于限定只检查部分元素；留空则表示全结构。
+  - `threshold` 默认 0.55，可按体系松紧调节。
+  - `motifs` 支持 `LocalStructOrderParams` 的所有类型（`tet`、`oct`、`tri_plan` 等），也可以写成更易读的别名（例如 `"tetrahedral"` 会自动映射为 `"tet"`，`"square planar"` 会映射为 `"sq_plan"`）。
+  - 若启用该检查，debug 目录只会保存“已经通过 motif 检查”的结构（raw/prepped/eval_fail/accepted 等标签都会自动过滤）。
+- `local_env_constraints`：面向元素的 CrystalNN + motif/CN 组合约束，比全局 `cn_range` 更精细。示例：
+  ```json
+  "local_env_constraints": {
+    "enabled": true,
+    "threshold": 0.7,
+    "global_cn_range": [2, 6],
+    "default_motifs": ["tetrahedral", "trigonal planar"],
+    "cn_rules": {
+      "Ga": {
+        "allowed_range": [2, 6],
+        "preferred_range": [3, 4],
+        "preferred_motifs": ["tetrahedral", "trigonal planar"]
+      },
+      "Sb": {
+        "allowed_range": [2, 6],
+        "preferred_range": [3, 5],
+        "preferred_motifs": ["trigonal pyramidal", "octahedral"]
+      }
+    }
+  }
+  ```
+  - `global_cn_range` 用作未单独配置元素的兜底配位区间，也会在缺失 `cn_rules`/`elements` 时回退；如果仍沿用旧版 `cn_range`，会被自动当成该兜底窗口。
+  - `default_motifs` 会在单个元素未声明 `preferred_motifs` 时提供公共 motif 列表。
+  - `cn_rules` 中可以分别声明 `allowed_range`（硬性 CN 范围）与 `preferred_range`（更窄的优选窗口，如果缺失则回退到 `allowed_range`），并在需要时附加元素专属的 `preferred_motifs`。若继续使用旧版 `elements` + `cn_range` 的写法，脚本也会自动解析并与 `cn_rules` 合并，后一者具有更高优先级。
+  - 若开启该模块，`CandidateEvaluator` 会在 SG 验证前对整结构运行 CrystalNN，任何元素 CN 越界或 motif 分数低于 `threshold` 的候选都会被立刻淘汰，调试信息会记录在 `meta.local_env` 中。
 - `debug_save_all_cands` / `debug_save_rejected`：现在会按照“raw/prepped/geom_fail/eval_fail/accepted”分阶段把结构保存在 `SG_xxx/debug/` 目录，方便定位问题。
 
 借助这些参数，可以把 `min_pair_dist` 的“全局阈值”细分到指定元素对，并在过滤阶段加入 motif 重叠与密度控制，更贴近 RG2/CALYPSO 等结构搜索程序中的硬球 + 修复流程。
