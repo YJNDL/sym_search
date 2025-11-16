@@ -89,6 +89,29 @@
   - `threshold` 默认 0.55，可按体系松紧调节。
   - `motifs` 支持 `LocalStructOrderParams` 的所有类型（`tet`、`oct`、`tri_plan` 等），也可以写成更易读的别名（例如 `"tetrahedral"` 会自动映射为 `"tet"`，`"square planar"` 会映射为 `"sq_plan"`）。
   - 若启用该检查，debug 目录只会保存“已经通过 motif 检查”的结构（raw/prepped/eval_fail/accepted 等标签都会自动过滤）。
+- `local_env_constraints`：面向元素的 CrystalNN + motif/CN 组合约束，比全局 `cn_range` 更精细。示例：
+  ```json
+  "local_env_constraints": {
+    "enabled": true,
+    "threshold": 0.7,
+    "global_cn_range": [2, 6],
+    "default_motifs": ["tetrahedral", "trigonal planar"],
+    "elements": {
+      "Ga": {
+        "cn_range": [3, 4],
+        "preferred_motifs": ["tetrahedral", "trigonal planar"]
+      },
+      "Sb": {
+        "cn_range": [3, 5],
+        "preferred_motifs": ["trigonal pyramidal", "octahedral"]
+      }
+    }
+  }
+  ```
+  - `global_cn_range` 用作未单独配置元素的兜底配位区间，也会在缺失 `elements` 时回退。
+  - `default_motifs` 会在单个元素未声明 `preferred_motifs` 时提供公共 motif 列表。
+  - `elements` 中的每个元素都可以自定义 `cn_range` 与 `preferred_motifs`，所有 motif 名称同样支持“tetrahedral/square planar”这类别名，脚本会在内部映射成 `LocalStructOrderParams` 的 token。
+  - 若开启该模块，`CandidateEvaluator` 会在 SG 验证前对整结构运行 CrystalNN，任何元素 CN 越界或 motif 分数低于 `threshold` 的候选都会被立刻淘汰，调试信息会记录在 `meta.local_env` 中。
 - `debug_save_all_cands` / `debug_save_rejected`：现在会按照“raw/prepped/geom_fail/eval_fail/accepted”分阶段把结构保存在 `SG_xxx/debug/` 目录，方便定位问题。
 
 借助这些参数，可以把 `min_pair_dist` 的“全局阈值”细分到指定元素对，并在过滤阶段加入 motif 重叠与密度控制，更贴近 RG2/CALYPSO 等结构搜索程序中的硬球 + 修复流程。
