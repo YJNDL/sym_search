@@ -47,6 +47,8 @@
     "min_bond_length_factor": 0.9,
     "hard_sphere_radius_scale": 0.95,
     "reject_if_overlap": true,
+    "enable_min_distance_filter": true,
+    "min_interatomic_distance": 1.2,
     "density_range": [0.01, 15.0],
     "post_gen_relax": {"mode": "hard_sphere", "max_iter": 40, "step": 0.5},
     "motif_overlap_tol": 0.25,
@@ -55,6 +57,17 @@
       "motifs": ["tet", "oct"],
       "threshold": 0.6,
       "species": ["Ga"]
+    },
+    "enable_motif_filter": true,
+    "motif_filter": {
+      "motifs": ["tetrahedral", "octahedral", "trigonal planar"],
+      "threshold": 0.65,
+      "species": ["Ga", "Sb"],
+      "cn_range": [3, 6],
+      "add_oxidation_states": true,
+      "crystalnn_kwargs": {
+        "distance_cutoffs": null
+      }
     },
 
     "local_env_constraints": {

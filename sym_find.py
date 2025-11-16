@@ -157,6 +157,52 @@ class PairDistanceReport:
     violations: List[Dict[str, object]] = field(default_factory=list)
 
 
+def is_structure_min_distance_ok(struct: Structure, min_dist: float):
+    """Check whether the minimum interatomic distance exceeds ``min_dist``.
+
+    Returns ``(passed, metrics, reason)`` where metrics include the
+    minimum distance, the corresponding species pair, and site indices.
+    """
+
+    metrics: Dict[str, object] = {
+        "threshold": float(min_dist) if min_dist is not None else None,
+        "min_distance": None,
+        "min_pair": None,
+        "pair_indices": None,
+    }
+
+    if min_dist is None or len(struct) < 2:
+        metrics["min_distance"] = None if len(struct) < 2 else 0.0
+        return True, metrics, None
+
+    dist_mat = struct.distance_matrix
+    iu = np.triu_indices(len(struct), k=1)
+    if iu[0].size == 0:
+        return True, metrics, None
+
+    pair_dists = dist_mat[iu]
+    min_idx = int(np.argmin(pair_dists))
+    dmin = float(pair_dists[min_idx])
+    site_i = int(iu[0][min_idx])
+    site_j = int(iu[1][min_idx])
+    species_i = struct[site_i].species_string
+    species_j = struct[site_j].species_string
+
+    metrics.update({
+        "min_distance": dmin,
+        "min_pair": (species_i, species_j),
+        "pair_indices": (site_i, site_j),
+    })
+
+    threshold = float(min_dist)
+    if dmin < threshold - 1e-6:
+        reason = (
+            f"最短原子距离 {dmin:.3f}Å ({species_i}-{species_j}) < 阈值 {threshold:.3f}Å"
+        )
+        return False, metrics, reason
+    return True, metrics, None
+
+
 @dataclass
 class PreprocessResult:
     ok: bool
@@ -563,6 +609,167 @@ class MotifReasonablenessChecker:
         return False, metrics, first_reason or "motif 检查失败"
 
 
+class CrystalNNMotifFilter:
+    """Light-weight motif sanity filter derived from aimd_env_tracker logic."""
+
+    def __init__(self, args):
+        self.enabled = as_bool(getattr(args, "enable_motif_filter", False))
+        cfg = dict(getattr(args, "motif_filter", {}) or {})
+        if "enabled" in cfg:
+            self.enabled = self.enabled and as_bool(cfg.get("enabled"))
+
+        motifs_raw = cfg.get("motifs") or []
+        motif_labels: List[str] = []
+        motif_tokens: List[str] = []
+        for item in motifs_raw:
+            text = str(item).strip()
+            if not text:
+                continue
+            token = _normalize_motif_token(text)
+            if token in motif_tokens:
+                continue
+            motif_labels.append(text)
+            motif_tokens.append(token)
+
+        self.threshold = float(cfg.get("threshold", 0.7))
+        species_raw = cfg.get("species") or []
+        self.species_filter = {str(s).strip().lower() for s in species_raw if str(s).strip()}
+
+        indices_raw = cfg.get("site_indices")
+        if indices_raw is None:
+            site_indices: Optional[Tuple[int, ...]] = None
+        elif isinstance(indices_raw, int):
+            site_indices = (int(indices_raw),)
+        else:
+            site_indices = tuple(int(i) for i in indices_raw if i is not None)
+        self.site_indices = site_indices
+
+        cn_range_cfg = cfg.get("cn_range")
+        self.cn_range: Optional[Tuple[float, float]] = None
+        if cn_range_cfg is not None:
+            self.cn_range = _parse_cn_range(cn_range_cfg, None)
+
+        self.add_oxidation_states = as_bool(cfg.get("add_oxidation_states", True))
+        self._nn_kwargs = dict(cfg.get("crystalnn_kwargs") or {})
+        self._motif_labels = motif_labels
+        self._motif_tokens = motif_tokens
+        self.enabled = self.enabled and bool(self._motif_tokens)
+        self._cnn: Optional[CrystalNN] = CrystalNN(**self._nn_kwargs) if self.enabled else None
+
+    @staticmethod
+    def _match_motif_key(op_dict: Dict[str, float], target_token: str) -> Optional[str]:
+        for key in op_dict.keys():
+            norm = _normalize_motif_token(key)
+            if norm == target_token:
+                return key
+            if target_token in {"squareplanar", "squarecoplanar"} and norm in {"squareplanar", "squarecoplanar"}:
+                return key
+        return None
+
+    def check(self, struct: Structure):
+        metrics: Dict[str, object] = {
+            "enabled": self.enabled,
+            "threshold": self.threshold,
+            "motifs": list(self._motif_labels),
+            "species_subset": sorted(self.species_filter) if self.species_filter else None,
+            "site_indices": list(self.site_indices) if self.site_indices is not None else None,
+            "cn_range": list(self.cn_range) if self.cn_range is not None else None,
+        }
+        if not self.enabled:
+            metrics.update({"passed": True, "checked_sites": 0, "motif_counts": {}, "failed_sites": []})
+            return True, metrics, None
+
+        if self._cnn is None:
+            metrics.update({"passed": False, "error": "CrystalNN 未初始化"})
+            return False, metrics, "motif_filter 未初始化"
+
+        st = struct.copy()
+        if self.add_oxidation_states:
+            try:
+                st.add_oxidation_state_by_guess()
+            except Exception as exc:  # pragma: no cover
+                metrics["oxidation_warning"] = str(exc)
+
+        indices = self.site_indices or tuple(range(len(st)))
+        failing: List[Dict[str, object]] = []
+        motif_counts: Counter = Counter()
+        checked = 0
+        first_reason: Optional[str] = None
+
+        for idx in indices:
+            if idx < 0 or idx >= len(st):
+                continue
+            site = st[idx]
+            if self.species_filter and site.species_string.lower() not in self.species_filter:
+                continue
+            checked += 1
+            try:
+                cn_val = float(self._cnn.get_cn(st, idx))
+            except Exception as exc:
+                metrics.update({"passed": False, "checked_sites": checked, "error": str(exc)})
+                return False, metrics, f"CrystalNN CN 失败: {exc}"
+
+            cn_reason = None
+            if self.cn_range is not None:
+                lo, hi = self.cn_range
+                if cn_val < lo - 1e-6 or cn_val > hi + 1e-6:
+                    cn_reason = f"CN {cn_val:.2f} 不在 [{lo:.2f}, {hi:.2f}]"
+
+            try:
+                op_dict = self._cnn.get_local_order_parameters(st, idx) or {}
+            except Exception as exc:
+                metrics.update({"passed": False, "checked_sites": checked, "error": str(exc)})
+                return False, metrics, f"CrystalNN order parameter 失败: {exc}"
+
+            best_score: Optional[float] = None
+            best_label: Optional[str] = None
+            motif_ok = False
+            for token, display in zip(self._motif_tokens, self._motif_labels):
+                key = self._match_motif_key(op_dict, token)
+                if key is None:
+                    continue
+                val = op_dict.get(key)
+                if val is None:
+                    continue
+                val_f = float(val)
+                if best_score is None or val_f > best_score:
+                    best_score = val_f
+                    best_label = key
+                if val_f >= self.threshold:
+                    motif_counts[display] += 1
+                    motif_ok = True
+                    break
+            site_passed = (cn_reason is None) and motif_ok
+            if not site_passed:
+                reason = cn_reason
+                if reason is None:
+                    if best_score is None:
+                        reason = "motif_missing"
+                    else:
+                        reason = f"motif_score {best_score:.3f} < 阈值 {self.threshold:.2f}"
+                failing.append({
+                    "index": idx,
+                    "species": site.species_string,
+                    "cn": cn_val,
+                    "best_score": best_score,
+                    "best_motif": best_label,
+                    "reason": reason,
+                })
+                if not first_reason:
+                    first_reason = f"site #{idx} {site.species_string} {reason}"
+
+        metrics.update({
+            "checked_sites": checked,
+            "motif_counts": dict(motif_counts),
+            "failed_sites": failing[:5],
+        })
+        passed = checked == 0 or not failing
+        metrics["passed"] = passed
+        if passed:
+            return True, metrics, None
+        return False, metrics, first_reason or "motif 过滤失败"
+
+
 # ------------------------------ 从 config.json 读取 settings ------------------------------
 
 def parse_sg_list(value):
@@ -617,125 +824,6 @@ def parse_sg_list(value):
     return sorted(set(out))
 
 
-def _parse_cn_range(value, fallback: Tuple[float, float]) -> Tuple[float, float]:
-    if value is None:
-        return tuple(float(x) for x in fallback)
-    if isinstance(value, str):
-        tokens = [tok.strip() for tok in value.split(",") if tok.strip()]
-    elif isinstance(value, (list, tuple)):
-        tokens = list(value)
-    else:
-        raise TypeError(f"cn_range 需为字符串或列表，收到 {value!r}")
-    if len(tokens) != 2:
-        raise ValueError(f"cn_range 需包含两个数值，收到 {tokens!r}")
-    lo, hi = float(tokens[0]), float(tokens[1])
-    if lo > hi:
-        lo, hi = hi, lo
-    return lo, hi
-
-
-def _parse_motif_list(raw, fallback: Sequence[str] = ()) -> Tuple[str, ...]:
-    if raw is None:
-        return tuple(str(m) for m in fallback)
-    if isinstance(raw, str):
-        items = [raw]
-    elif isinstance(raw, (list, tuple, set)):
-        items = list(raw)
-    else:
-        raise TypeError(f"preferred_motifs 需为字符串或数组，收到 {raw!r}")
-    motifs: List[str] = []
-    for item in items:
-        txt = str(item).strip()
-        if txt:
-            motifs.append(txt)
-    return tuple(motifs)
-
-
-def _ensure_species_list(value, fallback: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
-    if value is None:
-        if fallback is None:
-            raise ValueError("local_env_constraints: 缺少 species 指定")
-        value = fallback
-    if isinstance(value, str):
-        species = [value]
-    elif isinstance(value, (list, tuple, set)):
-        species = list(value)
-    else:
-        raise TypeError(f"species 需为字符串或字符串列表，收到 {value!r}")
-    normalized = []
-    for sp in species:
-        txt = str(sp).strip()
-        if txt:
-            normalized.append(txt)
-    if not normalized:
-        raise ValueError("species 列表不能为空")
-    return tuple(normalized)
-
-
-def normalize_local_env_constraints(params: Dict[str, object], cn_range_fallback: Tuple[int, int]):
-    raw = params.get("local_env_constraints")
-    if not raw:
-        return None
-    if not isinstance(raw, dict):
-        raise TypeError("local_env_constraints 需为对象")
-
-    default_cn_range = _parse_cn_range(raw.get("defaults", {}).get("cn_range"), tuple(float(x) for x in cn_range_fallback))
-    default_threshold = float(raw.get("defaults", {}).get("threshold", 0.7))
-    default_motifs = _parse_motif_list(raw.get("defaults", {}).get("preferred_motifs", ()))
-
-    normalized = {
-        "defaults": {
-            "cn_range": default_cn_range,
-            "threshold": default_threshold,
-            "preferred_motifs": default_motifs,
-            "label": raw.get("defaults", {}).get("label", "default"),
-        },
-        "rules": [],
-    }
-
-    entries = raw.get("elements")
-    if entries is None:
-        for key in ("rules", "per_species"):
-            if key in raw:
-                entries = raw[key]
-                break
-    if entries is None:
-        inferred = {k: v for k, v in raw.items() if k not in {"defaults", "elements", "rules", "per_species"}}
-        if inferred:
-            entries = inferred
-
-    if entries is None:
-        return normalized
-
-    def _iter_entries(obj):
-        if isinstance(obj, dict):
-            for key, val in obj.items():
-                yield key, val
-        elif isinstance(obj, list):
-            for val in obj:
-                yield None, val
-        else:
-            raise TypeError("local_env_constraints.elements 需为对象或数组")
-
-    for key, entry in _iter_entries(entries):
-        if not isinstance(entry, dict):
-            raise TypeError("local_env_constraints 元素需为对象")
-        species = _ensure_species_list(entry.get("species"), fallback=[key] if key else None)
-        cn_range = _parse_cn_range(entry.get("cn_range"), default_cn_range)
-        threshold = float(entry.get("threshold", default_threshold))
-        motifs = _parse_motif_list(entry.get("preferred_motifs"), default_motifs)
-        label = entry.get("label") or "/".join(species)
-        normalized["rules"].append({
-            "species": species,
-            "cn_range": cn_range,
-            "threshold": threshold,
-            "preferred_motifs": motifs,
-            "label": label,
-        })
-
-    return normalized
-
-
 def load_settings(config_path: str) -> argparse.Namespace:
     """
     只读 settings 部分，结构一律从 structure_file（默认 POSCAR）读取。
@@ -784,6 +872,8 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "min_bond_length_factor": 0.9,
         "hard_sphere_radius_scale": 0.95,
         "reject_if_overlap": True,
+        "enable_min_distance_filter": False,
+        "min_interatomic_distance": None,
         "motif_overlap_tol": 0.25,
         "density_range": None,
         "post_gen_relax": {"mode": "none", "max_iter": 30, "step": 0.4},
@@ -830,6 +920,16 @@ def load_settings(config_path: str) -> argparse.Namespace:
         },
 
         "local_env_constraints": {},
+        "enable_motif_filter": False,
+        "motif_filter": {
+            "motifs": [],
+            "threshold": 0.7,
+            "species": [],
+            "site_indices": None,
+            "cn_range": None,
+            "add_oxidation_states": True,
+            "crystalnn_kwargs": {},
+        },
 
         # 键长目标区间（Å）
         "bond_target_min": 2.2,
@@ -877,6 +977,15 @@ def load_settings(config_path: str) -> argparse.Namespace:
         motif_cfg["motifs"] = [str(m) for m in motifs_val]
     params["motif_checker"] = motif_cfg
 
+    motif_filter_defaults = defaults.get("motif_filter", {})
+    filter_raw = settings.get("motif_filter")
+    if filter_raw is not None and not isinstance(filter_raw, dict):
+        raise TypeError("motif_filter 需为对象")
+    motif_filter_cfg = {**motif_filter_defaults}
+    if isinstance(filter_raw, dict):
+        motif_filter_cfg.update(filter_raw)
+    params["motif_filter"] = motif_filter_cfg
+
     lec_raw = settings.get("local_env_constraints")
     if lec_raw is None:
         params["local_env_constraints"] = {}
@@ -901,13 +1010,21 @@ def load_settings(config_path: str) -> argparse.Namespace:
 
     # enable_sqrt3 / enable_bond_scaling: 布尔
     for key in ("enable_sqrt3", "enable_bond_scaling", "reject_if_overlap",
-                "debug_save_all_cands", "debug_save_rejected"):
+                "debug_save_all_cands", "debug_save_rejected",
+                "enable_min_distance_filter", "enable_motif_filter"):
         params[key] = as_bool(params.get(key))
 
     # 数值
     params["bond_target_min"] = float(params["bond_target_min"])
     params["bond_target_max"] = float(params["bond_target_max"])
     params["min_pair_dist"] = float(params["min_pair_dist"])
+    min_inter = params.get("min_interatomic_distance")
+    if min_inter is None:
+        params["min_interatomic_distance"] = None
+    else:
+        params["min_interatomic_distance"] = float(min_inter)
+    if params["enable_min_distance_filter"] and params["min_interatomic_distance"] is None:
+        params["min_interatomic_distance"] = params["min_pair_dist"]
     params["min_bond_length_factor"] = float(params.get("min_bond_length_factor", 0.9))
     params["hard_sphere_radius_scale"] = float(params.get("hard_sphere_radius_scale", 0.95))
     params["motif_overlap_tol"] = float(params.get("motif_overlap_tol", 0.25))
@@ -969,8 +1086,6 @@ def load_settings(config_path: str) -> argparse.Namespace:
     params["target_sgs"] = parse_sg_list(params.get("target_sgs"))
     excl = parse_sg_list(params.get("exclude_sgs"))
     params["exclude_sgs"] = excl if excl is not None else []
-
-    params["local_env_constraints"] = normalize_local_env_constraints(params, tuple(params["cn_range"]))
 
     return argparse.Namespace(**params)
 
@@ -1411,78 +1526,20 @@ def is_2d_structure(struct: Structure,
                     max_layer_thickness: Optional[float],
                     min_vacuum_thickness: Optional[float],
                     slab_center_tol: float) -> SlabValidationResult:
-    """Validate whether *struct* already represents a single 2D slab."""
+    """基于 validate_slab_geometry 的轻量封装，用于 GeometryFilter 的 2D 检查."""
 
     if struct is None:
-        return SlabValidationResult(False, reason="结构为空")
+        return SlabValidationResult(valid=False, reason="结构为空")
 
     axis_index, slab_center = _normalize_layer_axis(layer_axis)
-    axis_len = float(struct.lattice.lengths[axis_index])
-    if axis_len <= 1e-8:
-        return SlabValidationResult(
-            False,
-            reason=f"轴 {axis_index_to_label(axis_index)} 长度 {axis_len:.4f}Å 非法",
-            metrics={"slab_axis_length": axis_len},
-        )
-
-    coords = np.array([s.frac_coords[axis_index] for s in struct.sites], dtype=float)
-    if coords.size == 0:
-        slab_min = slab_max = 0.0
-    else:
-        rel = ((coords - slab_center + 0.5) % 1.0) - 0.5
-        rel_cart = rel * axis_len
-        slab_min = float(rel_cart.min())
-        slab_max = float(rel_cart.max())
-
-    slab_thickness = max(0.0, slab_max - slab_min)
-    vacuum_thickness = max(0.0, axis_len - slab_thickness)
-    center_offset_cart = 0.5 * (slab_max + slab_min)
-    center_offset_frac = center_offset_cart / axis_len
-    actual_center = (slab_center + center_offset_frac) % 1.0
-
-    metrics = {
-        "slab_axis_index": axis_index,
-        "slab_axis_label": axis_index_to_label(axis_index),
-        "slab_axis_length": axis_len,
-        "slab_thickness": slab_thickness,
-        "slab_vacuum": vacuum_thickness,
-        "slab_center_target": slab_center,
-        "slab_center_actual": actual_center,
-        "slab_center_offset": center_offset_frac,
-    }
-
-    tol = 1e-3
-    if max_layer_thickness is not None and max_layer_thickness > 0:
-        if slab_thickness > max_layer_thickness + tol:
-            return SlabValidationResult(
-                False,
-                reason=(
-                    f"厚度 {slab_thickness:.3f}Å 超出上限 {max_layer_thickness:.3f}Å"
-                ),
-                metrics=metrics,
-            )
-
-    if min_vacuum_thickness is not None and min_vacuum_thickness > 0:
-        if vacuum_thickness + tol < min_vacuum_thickness:
-            return SlabValidationResult(
-                False,
-                reason=(
-                    f"真空厚度 {vacuum_thickness:.3f}Å < 要求 {min_vacuum_thickness:.3f}Å"
-                ),
-                metrics=metrics,
-            )
-
-    if slab_center_tol is not None and slab_center_tol > 0:
-        if abs(center_offset_frac) > slab_center_tol + 1e-5:
-            return SlabValidationResult(
-                False,
-                reason=(
-                    f"层中心偏移 {center_offset_frac:.4f} 超出 tol={slab_center_tol:.4f}"
-                ),
-                metrics=metrics,
-            )
-
-    return SlabValidationResult(True, metrics=metrics)
+    return validate_slab_geometry(
+        struct,
+        axis_index=axis_index,
+        max_layer_thickness=max_layer_thickness,
+        min_vacuum_thickness=min_vacuum_thickness,
+        slab_center=slab_center,
+        slab_center_tol=slab_center_tol,
+    )
 
 
 def surface_corrugation_angstrom(struct: Structure,
@@ -2281,11 +2338,11 @@ class GeometryFilter:
         st = struct
         if self.projector and getattr(self.args, "reslab_after_relax", True):
             pre_val = self._validate_slab(st, metrics, stage="geom_pre_reslab", final=False)
-            if not pre_val.ok:
+            if not pre_val.valid:
                 return FilterResult(False, struct=st, reason=f"2D 几何无效: {pre_val.reason}", metrics=metrics)
             st, _ = self.projector.project(st, with_metrics=False)
             post_val = self._validate_slab(st, metrics, stage="geom_post_reslab_init", final=False)
-            if not post_val.ok:
+            if not post_val.valid:
                 return FilterResult(False, struct=st, reason=f"2D 几何无效: {post_val.reason}", metrics=metrics)
         if report.violations:
             relax_cfg = getattr(self.args, "post_gen_relax", {}) or {}
@@ -2298,11 +2355,11 @@ class GeometryFilter:
                 )
                 if self.projector and getattr(self.args, "reslab_after_relax", True):
                     post_relax_val = self._validate_slab(relaxed, metrics, stage="geom_post_relax", final=False)
-                    if not post_relax_val.ok:
+                    if not post_relax_val.valid:
                         return FilterResult(False, struct=relaxed, reason=f"2D 几何无效: {post_relax_val.reason}", metrics=metrics)
                     relaxed, _ = self.projector.project(relaxed, with_metrics=False)
                     post_relax_reslab = self._validate_slab(relaxed, metrics, stage="geom_post_relax_reslab", final=False)
-                    if not post_relax_reslab.ok:
+                    if not post_relax_reslab.valid:
                         return FilterResult(False, struct=relaxed, reason=f"2D 几何无效: {post_relax_reslab.reason}", metrics=metrics)
                 st = relaxed
                 report = self.constraints.analyze_pairs(st)
@@ -2373,25 +2430,31 @@ class GeometryFilter:
             return FilterResult(False, struct=st, reason="motif 重叠", metrics=metrics)
 
         final_val = self._validate_slab(st, metrics, stage="geom_final", final=True)
-        if not final_val.ok:
+        if not final_val.valid:
             return FilterResult(False, struct=st, reason=f"2D 几何无效: {final_val.reason}", metrics=metrics)
 
         metrics["physical_valid_geom"] = True
         return FilterResult(True, struct=st, metrics=metrics, physical_valid=True)
 
-    def _validate_slab(self, struct: Structure, metrics: Dict[str, object], stage: str, final: bool = False):
+    def _validate_slab(self, struct: Structure, metrics: Dict[str, object], stage: str, final: bool = False) -> SlabValidationResult:
+        """调用 is_2d_structure 并把结果记录到 metrics 中."""
+
         if not self.projector:
-            result = SlabValidationResult(True, metrics={})
-            record_slab_validation(metrics, stage, result, final=final)
-            return result
-        result = is_2d_structure(
-            struct,
-            layer_axis=self._layer_axis,
-            max_layer_thickness=self.args.layer_thickness_max,
-            min_vacuum_thickness=self._min_vacuum,
-            slab_center_tol=self._slab_center_tol,
-        )
-        record_slab_validation(metrics, stage, result, final=final)
+            result = SlabValidationResult(valid=True)
+        else:
+            result = is_2d_structure(
+                struct,
+                layer_axis=self._layer_axis,
+                max_layer_thickness=self.args.layer_thickness_max,
+                min_vacuum_thickness=self._min_vacuum,
+                slab_center_tol=self._slab_center_tol,
+            )
+
+        key = f"slab_{stage}"
+        metrics[key] = asdict(result)
+        if final:
+            metrics["slab_validation"] = asdict(result)
+            metrics["slab_valid"] = result.valid
         return result
 
 
@@ -2432,29 +2495,8 @@ class CandidateEvaluator:
             neighbor_species=self.args.neighbor_species,
         )
 
-        env_summary = None
-        if self.local_env_checker:
-            env_report = self.local_env_checker.analyze(struct)
-            env_summary = env_report.to_metrics()
-            if not env_report.ok:
-                return EvaluatorResult(False, reason=f"local_env: {env_report.reason}")
-
         local_env_metrics = None
-        if self.local_env_checker:
-            env_ok, env_metrics, env_reason = self.local_env_checker.check(struct)
-            local_env_metrics = env_metrics
-            if not env_ok:
-                return EvaluatorResult(False, reason=env_reason or "local_env 检查失败")
-
-        local_env_metrics = None
-        if self.local_env_checker:
-            env_ok, env_metrics, env_reason = self.local_env_checker.check(struct)
-            local_env_metrics = env_metrics
-            if not env_ok:
-                return EvaluatorResult(False, reason=env_reason or "local_env 检查失败")
-
-        local_env_metrics = None
-        if self.local_env_checker:
+        if self.local_env_checker and self.local_env_config and self.local_env_config.enabled:
             env_ok, env_metrics, env_reason = self.local_env_checker.check(struct)
             local_env_metrics = env_metrics
             if not env_ok:
@@ -2652,6 +2694,7 @@ def main():
     constraints = GeometryConstraints(args)
     generator = CandidateGenerator(args)
     motif_checker = MotifReasonablenessChecker(getattr(args, "motif_checker", {}))
+    motif_filter = CrystalNNMotifFilter(args)
     local_env_config = build_local_env_config(args)
     args.local_env_config = local_env_config
     local_env_checker = LocalEnvConstraintChecker(local_env_config)
@@ -2690,7 +2733,7 @@ def main():
                 should_save = args.debug_save_all_cands
             else:
                 should_save = args.debug_save_all_cands or args.debug_save_rejected
-            if not should_save or not physical_valid or debug_counter >= args.debug_max_per_sg:
+            if not should_save or debug_counter >= args.debug_max_per_sg:
                 return
             stem = f"cand_debug_det{det2}_scale{scale_ab:.4f}_{tag}_{debug_counter:03d}"
             save_structure_pair(struct, debug_dir, stem)
@@ -2718,7 +2761,17 @@ def main():
                 continue
 
             for st_raw in cands:
+                min_dist_metrics = None
+                motif_filter_metrics = None
                 debug_save(st_raw, det2, 1.0, "raw", motif_passed=(not motif_required))
+
+                if getattr(args, "enable_min_distance_filter", False) and args.min_interatomic_distance is not None:
+                    md_ok, md_metrics, md_reason = is_structure_min_distance_ok(st_raw, args.min_interatomic_distance)
+                    if not md_ok:
+                        append_log(log_path, f"[REJ][mindist] det={det2}  {md_reason}")
+                        debug_save(st_raw, det2, 1.0, "mindist_fail", motif_passed=(not motif_required))
+                        continue
+                    min_dist_metrics = md_metrics
 
                 pre_res = preprocessor.preprocess(st_raw)
                 motif_passed = pre_res.metrics.get("motif_check_passed", not motif_required)
@@ -2729,8 +2782,15 @@ def main():
 
                 debug_save(pre_res.struct, det2, pre_res.scale_ab, "prepped", motif_passed=motif_passed)
 
+                if motif_filter and motif_filter.enabled:
+                    motif_ok, motif_filter_metrics, motif_reason = motif_filter.check(pre_res.struct)
+                    if not motif_ok:
+                        append_log(log_path, f"[REJ][motif_filter] det={det2}  {motif_reason}")
+                        debug_save(pre_res.struct, det2, pre_res.scale_ab, "motif_fail", motif_passed=False)
+                        continue
+
                 filt_res = geom_filter.filter(pre_res.struct)
-                cand_physical_valid = bool(pre_res.physical_valid and filt_res.physical_valid)
+                cand_physical_valid = bool(filt_res.physical_valid)
                 if not filt_res.ok:
                     append_log(log_path, f"[REJ][geom] det={det2}  {filt_res.reason}")
                     debug_save(filt_res.struct or pre_res.struct, det2, pre_res.scale_ab, "geom_fail", motif_passed=motif_passed)
@@ -2741,6 +2801,10 @@ def main():
                 combined_meta.update(filt_res.metrics)
                 if "pair_min_after" in combined_meta:
                     combined_meta["dmin_any"] = combined_meta["pair_min_after"]
+                if min_dist_metrics:
+                    combined_meta["min_distance_filter"] = min_dist_metrics
+                if motif_filter_metrics:
+                    combined_meta["motif_filter"] = motif_filter_metrics
                 combined_meta["physical_valid"] = cand_physical_valid
 
                 eval_res = evaluator.evaluate(filt_res.struct, sg, det2, pre_res.scale_ab, combined_meta)
