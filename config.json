@@ -1,0 +1,44 @@
+{
+  "settings": {
+    "outdir": "out_gaas_sg26",
+    "structure_file": "GaSb_39.vasp",
+
+    "center_species": "Ga",
+    "neighbor_species": "Sb",
+    "cn_target": 4,
+    "cn_range": [3, 6],
+
+    "vacuum_c": 20.0,
+    "layer_thickness_max": 5.0,
+
+    "z_flat_tol": 2.0,
+    "surface_frac": 0.25,
+
+    "bond_target_min": 2.2,
+    "bond_target_max": 2.8,
+    "enable_bond_scaling": true,
+
+    "bond_scaling_mode": "soft",
+    "bond_coverage_min": 0.8,
+
+    "min_pair_dist": 1.8,
+
+    "bond_tol": 0.4,
+    "w_cost_d": 1.0,
+    "w_cost_cn": 0.5,
+
+    "symprec": [0.001, 0.002, 0.005],
+    "angle_tol": 0.5,
+
+    "det_max": 6,
+    "max_atoms": 96,
+    "enable_sqrt3": true,
+    "samples_per_sg": 50,
+    "topk": 3,
+    "seed": 2025,
+
+    "debug_save_all_cands": true,
+    "debug_save_rejected": true,
+    "debug_max_per_sg": 30
+  }
+}
