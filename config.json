@@ -62,6 +62,11 @@
       "enable_min_distance_filter": true,
       "min_interatomic_distance": 1.2
     },
+    "distance_auto_scale": {
+      "enable": true,
+      "target_min_distance": 2.5,
+      "safety_margin": 0.05
+    },
     "vacuum_filter": {
       "enable_vacuum_check": true,
       "min_vacuum_thickness_angstrom": 8.0,

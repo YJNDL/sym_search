@@ -429,6 +429,12 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "min_interatomic_distance": 1.2,
     }
 
+    distance_auto_scale_defaults = {
+        "enable": True,
+        "target_min_distance": 2.5,
+        "safety_margin": 0.05,
+    }
+
     vacuum_filter_defaults = {
         "enable_vacuum_check": True,
         "min_vacuum_thickness_angstrom": 8.0,
@@ -525,6 +531,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "exclude_sgs": [],
 
         "filters": filter_defaults,
+        "distance_auto_scale": distance_auto_scale_defaults,
         "vacuum_filter": vacuum_filter_defaults,
         "vacuum_auto_fix": vacuum_auto_fix_defaults,
         "spacegroup_filter": spacegroup_filter_defaults,
@@ -532,8 +539,9 @@ def load_settings(config_path: str) -> argparse.Namespace:
 
     # 合并默认和用户设置
     settings_filters = settings.get("filters", {}) if isinstance(settings, dict) else {}
-    params = {**defaults, **{k: v for k, v in settings.items() if k not in {"filters", "vacuum_filter", "vacuum_auto_fix", "spacegroup_filter"}}}
+    params = {**defaults, **{k: v for k, v in settings.items() if k not in {"filters", "distance_auto_scale", "vacuum_filter", "vacuum_auto_fix", "spacegroup_filter"}}}
     params["filters"] = {**filter_defaults, **settings_filters}
+    params["distance_auto_scale"] = {**distance_auto_scale_defaults, **settings.get("distance_auto_scale", {})}
     params["vacuum_filter"] = {**vacuum_filter_defaults, **settings.get("vacuum_filter", {})}
     params["vacuum_auto_fix"] = {**vacuum_auto_fix_defaults, **settings.get("vacuum_auto_fix", {})}
     params["spacegroup_filter"] = {**spacegroup_filter_defaults, **settings.get("spacegroup_filter", {})}
@@ -558,6 +566,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
         params[key] = as_bool(params.get(key))
 
     params["filters"]["enable_min_distance_filter"] = as_bool(params["filters"].get("enable_min_distance_filter", True))
+    params["distance_auto_scale"]["enable"] = as_bool(params["distance_auto_scale"].get("enable", True))
     params["vacuum_filter"]["enable_vacuum_check"] = as_bool(params["vacuum_filter"].get("enable_vacuum_check", True))
     params["vacuum_auto_fix"]["enable_auto_fix"] = as_bool(params["vacuum_auto_fix"].get("enable_auto_fix", True))
     params["spacegroup_filter"]["enable_spacegroup_check_after_fix"] = as_bool(
@@ -565,6 +574,12 @@ def load_settings(config_path: str) -> argparse.Namespace:
     )
 
     params["filters"]["min_interatomic_distance"] = float(params["filters"].get("min_interatomic_distance", 1.2))
+    params["distance_auto_scale"]["target_min_distance"] = float(
+        params["distance_auto_scale"].get("target_min_distance", 2.5)
+    )
+    params["distance_auto_scale"]["safety_margin"] = float(
+        params["distance_auto_scale"].get("safety_margin", 0.0)
+    )
     params["vacuum_filter"]["min_vacuum_thickness_angstrom"] = float(
         params["vacuum_filter"].get("min_vacuum_thickness_angstrom", 8.0)
     )
@@ -857,6 +872,56 @@ def auto_fix_vacuum_with_pymatgen(structure: Structure,
     )
     _, new_vacuum, _ = has_sufficient_vacuum(fixed_structure, 0.0, direction)
     return fixed_structure, new_vacuum
+
+
+def auto_scale_slab_for_short_bonds(structure: Structure,
+                                    violations: Sequence[Dict[str, object]],
+                                    constraints: GeometryConstraints,
+                                    config: Optional[Dict[str, object]] = None):
+    """Isotropically scale the lattice to eliminate short bonds."""
+
+    if structure is None:
+        return None, 1.0, None
+
+    config = config or {}
+    if not violations:
+        report = constraints.analyze_pairs(structure)
+        return structure.copy(), 1.0, report
+
+    if not as_bool(config.get("enable", True)):
+        return None, 1.0, None
+
+    target_min = float(config.get("target_min_distance", 2.5))
+    margin = max(0.0, float(config.get("safety_margin", 0.0)))
+
+    scale_factor = 1.0
+    for violation in violations:
+        dist = float(violation.get("distance") or 0.0)
+        thresh = float(violation.get("threshold") or 0.0)
+        if dist <= 1e-8:
+            dist = 1e-8
+        target_ij = max(target_min, thresh)
+        if margin > 0:
+            target_ij += margin
+        if target_ij <= 0:
+            continue
+        scale_factor = max(scale_factor, target_ij / dist)
+
+    if scale_factor <= 1.0:
+        scale_factor = 1.0 + margin
+
+    try:
+        scaled = structure.copy()
+        new_volume = float(structure.volume) * (scale_factor ** 3)
+        scaled.scale_lattice(new_volume)
+    except Exception:
+        return None, scale_factor, None
+
+    report = constraints.analyze_pairs(scaled)
+    if report.violations:
+        return None, scale_factor, report
+
+    return scaled, scale_factor, report
 
 
 def get_spacegroup_info(structure: Structure,
@@ -1424,6 +1489,7 @@ class CandidatePreprocessor:
         self.args = args
         self.projector = projector
         self.constraints = constraints
+        self.distance_auto_scale_cfg = getattr(args, "distance_auto_scale", {}) or {}
 
     def preprocess(self, struct: Structure) -> PreprocessResult:
         st, slab_metrics = self.projector.project(struct, with_metrics=True)
@@ -1465,13 +1531,19 @@ class CandidatePreprocessor:
             })
             metrics.update(pair_metrics)
             if report.violations:
-                return PreprocessResult(
-                    False,
-                    struct=st,
-                    reason=self._pair_violation_reason(report.violations[0]),
-                    metrics=metrics,
+                before_min = report.min_distance
+                scaled_struct, report, scale_factor, reason = self._resolve_short_bonds(st, report)
+                if reason:
+                    return PreprocessResult(False, struct=st, reason=reason, metrics=metrics)
+                st = scaled_struct
+                metrics["distance_auto_scale"] = self._distance_auto_scale_meta(
+                    scale_factor,
+                    before_min,
+                    report.min_distance,
                 )
-            return PreprocessResult(True, struct=st, scale_ab=1.0, metrics=metrics)
+                metrics["dmin_any"] = report.min_distance
+            scale_factor = metrics.get("distance_auto_scale", {}).get("scale_factor", 1.0)
+            return PreprocessResult(True, struct=st, scale_ab=scale_factor, metrics=metrics)
 
         ok, scaled, scale, extra_metrics, reason = self._apply_scaling(st, cand_d)
         if not ok or scaled is None:
@@ -1534,7 +1606,21 @@ class CandidatePreprocessor:
         phys_min = report.min_distance
 
         if report.violations:
-            return False, None, 1.0, pair_metrics, self._pair_violation_reason(report.violations[0])
+            before_min = report.min_distance
+            scaled_struct, report, extra_scale, reason = self._resolve_short_bonds(scaled, report)
+            if reason:
+                return False, None, 1.0, pair_metrics, reason
+            scaled = scaled_struct
+            report, pair_metrics = self._pair_metrics(scaled, prefix="scaled")
+            pair_metrics["distance_auto_scale"] = self._distance_auto_scale_meta(
+                extra_scale,
+                before_min,
+                report.min_distance,
+            )
+            cand_d_scaled = cand_d_scaled * extra_scale
+            cand_min_scaled = float(np.min(cand_d_scaled))
+            cand_max_scaled = float(np.max(cand_d_scaled))
+            phys_min = report.min_distance
 
         if mode == "strict":
             if cand_min_scaled < bond_min - 1e-3 or cand_max_scaled > bond_max + 1e-3:
@@ -1567,7 +1653,8 @@ class CandidatePreprocessor:
             "bond_target_range": [bond_min, bond_max],
         }
         metrics.update(pair_metrics)
-        return True, scaled, s_target, metrics, None
+        total_scale = s_target * metrics.get("distance_auto_scale", {}).get("scale_factor", 1.0)
+        return True, scaled, total_scale, metrics, None
 
     def _pair_metrics(self, struct: Structure, prefix: str):
         report = self.constraints.analyze_pairs(struct)
@@ -1578,6 +1665,39 @@ class CandidatePreprocessor:
             f"{prefix}_pair_violations": report.violations[:5],
         }
         return report, metrics
+
+    def _resolve_short_bonds(self, struct: Structure, report: PairDistanceReport):
+        cfg = self.distance_auto_scale_cfg or {}
+        if not report.violations:
+            return struct, report, 1.0, None
+        if not cfg.get("enable", True):
+            reason = (
+                f"short bonds detected but distance_auto_scale disabled (min_dist={report.min_distance:.3f}Å)"
+            )
+            return None, report, 1.0, reason
+        scaled_struct, scale_factor, scaled_report = auto_scale_slab_for_short_bonds(
+            struct,
+            report.violations,
+            self.constraints,
+            cfg,
+        )
+        if scaled_struct is None or scaled_report is None:
+            reason = f"auto-scale failed for short bonds (min_dist={report.min_distance:.3f}Å)"
+            return None, report, scale_factor, reason
+        if scaled_report.violations:
+            reason = f"still has short bonds after scaling (min_dist={scaled_report.min_distance:.3f}Å)"
+            return None, scaled_report, scale_factor, reason
+        return scaled_struct, scaled_report, scale_factor, None
+
+    def _distance_auto_scale_meta(self, scale_factor: float, before: float, after: float):
+        cfg = self.distance_auto_scale_cfg or {}
+        return {
+            "scale_factor": float(scale_factor),
+            "min_before": float(before),
+            "min_after": float(after),
+            "target_min_distance": float(cfg.get("target_min_distance", 2.5)),
+            "safety_margin": float(cfg.get("safety_margin", 0.0)),
+        }
 
     @staticmethod
     def _pair_violation_reason(violation: Dict[str, object]) -> str:
@@ -2044,6 +2164,26 @@ def main():
                     append_log(log_path, f"[KEEP] det={det2} cand={cand_idx}  spacegroup after vacuum fix: {sg_symbol} ({sg_number})")
 
                 pre_res = preprocessor.preprocess(current_struct)
+                scale_meta = pre_res.metrics.get("distance_auto_scale") if pre_res.metrics else None
+                if scale_meta:
+                    scale_factor = scale_meta.get("scale_factor")
+                    before = scale_meta.get("min_before")
+                    after = scale_meta.get("min_after")
+                    target = scale_meta.get("target_min_distance")
+                    if scale_factor and before is not None and after is not None:
+                        msg = (
+                            f"[SCALE][prep] det={det2} scale_factor={scale_factor:.3f}, "
+                            f"min_dist: {before:.3f}Å -> {after:.3f}Å"
+                        )
+                        if target is not None:
+                            msg += f" (target ≥ {target:.3f}Å)"
+                        append_log(log_path, msg)
+                        if pre_res.ok:
+                            append_log(
+                                log_path,
+                                (f"[KEEP][prep] det={det2} structure kept after scaling "
+                                 f"(scale_factor={scale_factor:.3f})"),
+                            )
                 if not pre_res.ok:
                     append_log(log_path, f"[REJ][prep] det={det2}  {pre_res.reason}")
                     debug_save(pre_res.struct or current_struct, det2, pre_res.scale_ab, "prep_fail")
