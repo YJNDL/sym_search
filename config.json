@@ -30,6 +30,12 @@
     "density_range": [0.01, 15.0],
     "post_gen_relax": {"mode": "hard_sphere", "max_iter": 40, "step": 0.5},
     "motif_overlap_tol": 0.25,
+    "motif_checker": {
+      "enabled": true,
+      "motifs": ["tet", "oct"],
+      "threshold": 0.6,
+      "species": ["Ga"]
+    },
 
     "bond_target_min": 2.2,
     "bond_target_max": 2.8,
