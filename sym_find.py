@@ -164,6 +164,7 @@ class PreprocessResult:
     scale_ab: float = 1.0
     reason: Optional[str] = None
     metrics: Dict[str, object] = field(default_factory=dict)
+    physical_valid: bool = False
 
 
 @dataclass
@@ -172,6 +173,7 @@ class FilterResult:
     struct: Optional[Structure] = None
     metrics: Dict[str, object] = field(default_factory=dict)
     reason: Optional[str] = None
+    physical_valid: bool = False
 
 
 @dataclass
@@ -1653,6 +1655,7 @@ class CandidatePreprocessor:
     def preprocess(self, struct: Structure) -> PreprocessResult:
         st, slab_metrics = self.projector.project(struct, with_metrics=True)
         metrics: Dict[str, object] = dict(slab_metrics)
+        metrics["physical_valid_pre"] = False
 
         slab_check = self._validate_slab(st, metrics, stage="preprocessor", final=True)
         if not slab_check.ok:
@@ -1706,7 +1709,8 @@ class CandidatePreprocessor:
                 metrics["local_env_pre"] = env_check.to_metrics()
                 if not env_check.ok:
                     return PreprocessResult(False, struct=st, reason=f"local_env: {env_check.reason}", metrics=metrics)
-            return PreprocessResult(True, struct=st, scale_ab=1.0, metrics=metrics)
+            metrics["physical_valid_pre"] = True
+            return PreprocessResult(True, struct=st, scale_ab=1.0, metrics=metrics, physical_valid=True)
 
         ok, scaled, scale, extra_metrics, reason = self._apply_scaling(st, cand_d)
         if not ok or scaled is None:
@@ -1718,7 +1722,8 @@ class CandidatePreprocessor:
             metrics["local_env_pre"] = env_check.to_metrics()
             if not env_check.ok:
                 return PreprocessResult(False, struct=scaled, reason=f"local_env: {env_check.reason}", metrics=metrics)
-        return PreprocessResult(True, struct=scaled, scale_ab=scale, metrics=metrics)
+        metrics["physical_valid_pre"] = True
+        return PreprocessResult(True, struct=scaled, scale_ab=scale, metrics=metrics, physical_valid=True)
 
     def _validate_slab(self, struct: Structure, metrics: Dict[str, object], stage: str, final: bool = False):
         if not self.projector:
@@ -1875,6 +1880,7 @@ class GeometryFilter:
             "pair_violation_count": len(report.violations),
             "pair_violations": report.violations,
         }
+        metrics["physical_valid_geom"] = False
 
         st = struct
         if self.projector and getattr(self.args, "reslab_after_relax", True):
@@ -1974,7 +1980,8 @@ class GeometryFilter:
         if not final_val.ok:
             return FilterResult(False, struct=st, reason=f"2D 几何无效: {final_val.reason}", metrics=metrics)
 
-        return FilterResult(True, struct=st, metrics=metrics)
+        metrics["physical_valid_geom"] = True
+        return FilterResult(True, struct=st, metrics=metrics, physical_valid=True)
 
     def _validate_slab(self, struct: Structure, metrics: Dict[str, object], stage: str, final: bool = False):
         if not self.projector:
@@ -2233,7 +2240,13 @@ def main():
         debug_dir = makedirs(os.path.join(sg_dir, "debug"))
         debug_counter = 0
 
-        def debug_save(struct: Optional[Structure], det2: int, scale_ab: float, tag: str, accepted: bool = False):
+        def debug_save(struct: Optional[Structure],
+                       det2: int,
+                       scale_ab: float,
+                       tag: str,
+                       *,
+                       physical_valid: bool = False,
+                       accepted: bool = False):
             nonlocal debug_counter
             if struct is None:
                 return
@@ -2241,7 +2254,7 @@ def main():
                 should_save = args.debug_save_all_cands
             else:
                 should_save = args.debug_save_all_cands or args.debug_save_rejected
-            if not should_save or debug_counter >= args.debug_max_per_sg:
+            if not should_save or not physical_valid or debug_counter >= args.debug_max_per_sg:
                 return
             stem = f"cand_debug_det{det2}_scale{scale_ab:.4f}_{tag}_{debug_counter:03d}"
             save_structure_pair(struct, debug_dir, stem)
@@ -2269,20 +2282,35 @@ def main():
                 continue
 
             for st_raw in cands:
-                debug_save(st_raw, det2, 1.0, "raw")
+                cand_physical_valid = False
+                debug_save(st_raw, det2, 1.0, "raw", physical_valid=cand_physical_valid)
 
                 pre_res = preprocessor.preprocess(st_raw)
+                cand_physical_valid = bool(pre_res.physical_valid)
                 if not pre_res.ok:
                     append_log(log_path, f"[REJ][prep] det={det2}  {pre_res.reason}")
-                    debug_save(pre_res.struct or st_raw, det2, pre_res.scale_ab, "prep_fail")
+                    debug_save(pre_res.struct or st_raw,
+                               det2,
+                               pre_res.scale_ab,
+                               "prep_fail",
+                               physical_valid=cand_physical_valid)
                     continue
 
-                debug_save(pre_res.struct, det2, pre_res.scale_ab, "prepped")
+                debug_save(pre_res.struct,
+                           det2,
+                           pre_res.scale_ab,
+                           "prepped",
+                           physical_valid=cand_physical_valid)
 
                 filt_res = geom_filter.filter(pre_res.struct)
+                cand_physical_valid = bool(pre_res.physical_valid and filt_res.physical_valid)
                 if not filt_res.ok:
                     append_log(log_path, f"[REJ][geom] det={det2}  {filt_res.reason}")
-                    debug_save(filt_res.struct or pre_res.struct, det2, pre_res.scale_ab, "geom_fail")
+                    debug_save(filt_res.struct or pre_res.struct,
+                               det2,
+                               pre_res.scale_ab,
+                               "geom_fail",
+                               physical_valid=cand_physical_valid)
                     continue
 
                 combined_meta: Dict[str, object] = {}
@@ -2290,11 +2318,16 @@ def main():
                 combined_meta.update(filt_res.metrics)
                 if "pair_min_after" in combined_meta:
                     combined_meta["dmin_any"] = combined_meta["pair_min_after"]
+                combined_meta["physical_valid"] = cand_physical_valid
 
                 eval_res = evaluator.evaluate(filt_res.struct, sg, det2, pre_res.scale_ab, combined_meta)
                 if not eval_res.ok:
                     append_log(log_path, f"[REJ][eval] det={det2}  {eval_res.reason}")
-                    debug_save(filt_res.struct, det2, pre_res.scale_ab, "eval_fail")
+                    debug_save(filt_res.struct,
+                               det2,
+                               pre_res.scale_ab,
+                               "eval_fail",
+                               physical_valid=cand_physical_valid)
                     continue
 
                 prim = eval_res.primitive
@@ -2303,11 +2336,20 @@ def main():
                 is_dup = any(matchers[sg].fit(prim, item["primitive"]) for item in found)
                 if is_dup:
                     append_log(log_path, f"[SKIP] det={det2}  发现重复结构，跳过")
-                    debug_save(prim, det2, pre_res.scale_ab, "dup")
+                    debug_save(prim,
+                               det2,
+                               pre_res.scale_ab,
+                               "dup",
+                               physical_valid=cand_physical_valid)
                     continue
 
                 found.append({"primitive": prim, "meta": meta})
-                debug_save(prim, det2, pre_res.scale_ab, "accepted", accepted=True)
+                debug_save(prim,
+                           det2,
+                           pre_res.scale_ab,
+                           "accepted",
+                           physical_valid=cand_physical_valid,
+                           accepted=True)
 
         # 每个 SG 只保留 topk
         found = sorted(found, key=lambda x: (x["meta"]["cost"], -x["meta"]["dmin_any"]))[:args.topk]
