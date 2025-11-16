@@ -42,7 +42,7 @@
 ### 几何过滤 / 调参要点
 最新版脚本把候选筛选流程拆成“生成 → 预处理 → 几何过滤 → 评分”四层：
 
-1. **预处理 (`CandidatePreprocessor`)**：套入真空层、压缩厚度，控制表面起伏，并按 `bond_target_min/max` 自动缩放 a/b。若 `enable_bond_scaling=false`，也会记录原始键长与最短原子间距。
+1. **预处理 (`CandidatePreprocessor`)**：套入真空层、压缩厚度，控制表面起伏，并按 `bond_target_min/max` 自动缩放 a/b。缩放后的结构会立刻套用 `min_pair_dist_matrix`/硬球半径，逐一检查所有元素对（Ga–Ga、Sb–Sb 等）的最小距离，若违反阈值直接在该阶段淘汰；若 `enable_bond_scaling=false`，仍会记录原始键长与最短原子间距。
 2. **几何过滤 (`GeometryFilter`)**：
    - 依据元素对的最小距离矩阵/原子半径进行硬球检查，可选 `post_gen_relax` 做快速硬球松弛。
    - 计算层密度、motif 包络（基于等价原子 & 硬球半径），若 `reject_if_overlap=true` 则直接丢弃重叠或过密结构。
@@ -62,7 +62,7 @@
 
 可以在 `config.json` 中调节下列关键参数：
 
-- `min_pair_dist_matrix`：元素对最小距离矩阵。既支持 `{"Ga-Sb": 2.3}` 这样的扁平键值，也支持嵌套写法：
+- `min_pair_dist_matrix`：元素对最小距离矩阵，预处理和几何过滤都会使用。既支持 `{"Ga-Sb": 2.3}` 这样的扁平键值，也支持嵌套写法：
   ```json
   "min_pair_dist_matrix": {
     "Ga": {"Ga": 2.6, "Sb": 2.3},

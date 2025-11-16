@@ -1197,9 +1197,10 @@ class SlabProjector:
 
 
 class CandidatePreprocessor:
-    def __init__(self, args, projector: SlabProjector):
+    def __init__(self, args, projector: SlabProjector, constraints: GeometryConstraints):
         self.args = args
         self.projector = projector
+        self.constraints = constraints
 
     def preprocess(self, struct: Structure) -> PreprocessResult:
         st, slab_metrics = self.projector.project(struct, with_metrics=True)
@@ -1233,11 +1234,20 @@ class CandidatePreprocessor:
         if not self.args.enable_bond_scaling:
             cand_min = float(np.min(cand_d))
             cand_max = float(np.max(cand_d))
+            report, pair_metrics = self._pair_metrics(st, prefix="pre")
             metrics.update({
                 "bond_min": cand_min,
                 "bond_max": cand_max,
-                "dmin_any": min_any_pair_distance(st),
+                "dmin_any": report.min_distance,
             })
+            metrics.update(pair_metrics)
+            if report.violations:
+                return PreprocessResult(
+                    False,
+                    struct=st,
+                    reason=self._pair_violation_reason(report.violations[0]),
+                    metrics=metrics,
+                )
             return PreprocessResult(True, struct=st, scale_ab=1.0, metrics=metrics)
 
         ok, scaled, scale, extra_metrics, reason = self._apply_scaling(st, cand_d)
@@ -1297,7 +1307,11 @@ class CandidatePreprocessor:
         )
         cand_min_scaled = float(np.min(cand_d_scaled))
         cand_max_scaled = float(np.max(cand_d_scaled))
-        phys_min = min_any_pair_distance(scaled)
+        report, pair_metrics = self._pair_metrics(scaled, prefix="scaled")
+        phys_min = report.min_distance
+
+        if report.violations:
+            return False, None, 1.0, pair_metrics, self._pair_violation_reason(report.violations[0])
 
         if mode == "strict":
             if cand_min_scaled < bond_min - 1e-3 or cand_max_scaled > bond_max + 1e-3:
@@ -1329,7 +1343,30 @@ class CandidatePreprocessor:
             "scale_applied": s_target,
             "bond_target_range": [bond_min, bond_max],
         }
+        metrics.update(pair_metrics)
         return True, scaled, s_target, metrics, None
+
+    def _pair_metrics(self, struct: Structure, prefix: str):
+        report = self.constraints.analyze_pairs(struct)
+        metrics = {
+            f"{prefix}_pair_min": report.min_distance,
+            f"{prefix}_pair_min_species": report.min_pair,
+            f"{prefix}_pair_violation_count": len(report.violations),
+            f"{prefix}_pair_violations": report.violations[:5],
+        }
+        return report, metrics
+
+    @staticmethod
+    def _pair_violation_reason(violation: Dict[str, object]) -> str:
+        spec_i = violation.get("species_i")
+        spec_j = violation.get("species_j")
+        dist = violation.get("distance")
+        thresh = violation.get("threshold")
+        return (
+            f"pair {spec_i}-{spec_j} 距离 {dist:.3f}Å < 阈值 {thresh:.3f}Å"
+            if dist is not None and thresh is not None
+            else "pair distance violation"
+        )
 
 
 class GeometryFilter:
@@ -1664,7 +1701,7 @@ def main():
 
     constraints = GeometryConstraints(args)
     generator = CandidateGenerator(args)
-    preprocessor = CandidatePreprocessor(args, slab_projector)
+    preprocessor = CandidatePreprocessor(args, slab_projector, constraints)
     geom_filter = GeometryFilter(args, constraints, symprecs, slab_projector)
     evaluator = CandidateEvaluator(args, ref_stats, symprecs, (cn_lo, cn_hi), projector=slab_projector)
 
