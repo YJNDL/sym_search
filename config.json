@@ -14,6 +14,18 @@
     "z_flat_tol": 2.0,
     "surface_frac": 0.25,
 
+    "min_pair_dist_matrix": {
+      "Ga-Ga": 2.6,
+      "Ga-Sb": 2.3,
+      "Sb-Sb": 2.6
+    },
+    "min_bond_length_factor": 0.9,
+    "hard_sphere_radius_scale": 0.95,
+    "reject_if_overlap": true,
+    "density_range": [0.01, 15.0],
+    "post_gen_relax": {"mode": "hard_sphere", "max_iter": 40, "step": 0.5},
+    "motif_overlap_tol": 0.25,
+
     "bond_target_min": 2.2,
     "bond_target_max": 2.8,
     "enable_bond_scaling": true,
