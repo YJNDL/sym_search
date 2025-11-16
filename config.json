@@ -56,6 +56,27 @@
 
     "debug_save_all_cands": true,
     "debug_save_rejected": true,
-    "debug_max_per_sg": 30
+    "debug_max_per_sg": 30,
+
+    "filters": {
+      "enable_min_distance_filter": true,
+      "min_interatomic_distance": 1.2
+    },
+    "vacuum_filter": {
+      "enable_vacuum_check": true,
+      "min_vacuum_thickness_angstrom": 8.0,
+      "vacuum_direction": "c"
+    },
+    "vacuum_auto_fix": {
+      "enable_auto_fix": true,
+      "target_vacuum_thickness_angstrom": 15.0
+    },
+    "spacegroup_filter": {
+      "enable_spacegroup_check_after_fix": true,
+      "target_spacegroup_number": null,
+      "target_spacegroup_symbol": null,
+      "symprec": 0.001,
+      "angle_tolerance": 5.0
+    }
   }
 }
