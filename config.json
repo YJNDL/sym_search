@@ -1,0 +1,61 @@
+{
+  "settings": {
+    "outdir": "out_gaas_sg26",
+    "structure_file": "GaSb_39.vasp",
+
+    "center_species": "Ga",
+    "neighbor_species": "Sb",
+    "cn_target": 4,
+    "cn_range": [3, 6],
+
+    "vacuum_thickness": 20.0,
+    "vacuum_buffer": 1.0,
+    "layer_axis": "c",
+    "slab_center": 0.5,
+    "layer_thickness": 4.0,
+    "layer_thickness_max": 5.0,
+    "reslab_after_relax": true,
+
+    "z_flat_tol": 2.0,
+    "surface_frac": 0.25,
+
+    "min_pair_dist_matrix": {
+      "Ga-Ga": 2.6,
+      "Ga-Sb": 2.3,
+      "Sb-Sb": 2.6
+    },
+    "min_bond_length_factor": 0.9,
+    "hard_sphere_radius_scale": 0.95,
+    "reject_if_overlap": true,
+    "density_range": [0.01, 15.0],
+    "post_gen_relax": {"mode": "hard_sphere", "max_iter": 40, "step": 0.5},
+    "motif_overlap_tol": 0.25,
+
+    "bond_target_min": 2.2,
+    "bond_target_max": 2.8,
+    "enable_bond_scaling": true,
+
+    "bond_scaling_mode": "soft",
+    "bond_coverage_min": 0.8,
+
+    "min_pair_dist": 1.8,
+
+    "bond_tol": 0.4,
+    "w_cost_d": 1.0,
+    "w_cost_cn": 0.5,
+
+    "symprec": [0.001, 0.002, 0.005],
+    "angle_tol": 0.5,
+
+    "det_max": 12,
+    "max_atoms": 96,
+    "enable_sqrt3": true,
+    "samples_per_sg": 50,
+    "topk": 3,
+    "seed": 2025,
+
+    "debug_save_all_cands": true,
+    "debug_save_rejected": true,
+    "debug_max_per_sg": 30
+  }
+}
