@@ -427,9 +427,25 @@ def load_settings(config_path: str) -> argparse.Namespace:
     filter_defaults = {
         "enable_min_distance_filter": True,
         "min_interatomic_distance": 1.2,
-        "enable_vacuum_filter": True,
-        "min_vacuum_thickness": 8.0,
-        "vacuum_axis": "c",
+    }
+
+    vacuum_filter_defaults = {
+        "enable_vacuum_check": True,
+        "min_vacuum_thickness_angstrom": 8.0,
+        "vacuum_direction": "c",
+    }
+
+    vacuum_auto_fix_defaults = {
+        "enable_auto_fix": True,
+        "target_vacuum_thickness_angstrom": 15.0,
+    }
+
+    spacegroup_filter_defaults = {
+        "enable_spacegroup_check_after_fix": True,
+        "target_spacegroup_number": None,
+        "target_spacegroup_symbol": None,
+        "symprec": 1e-3,
+        "angle_tolerance": 5.0,
     }
 
     defaults = {
@@ -509,12 +525,18 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "exclude_sgs": [],
 
         "filters": filter_defaults,
+        "vacuum_filter": vacuum_filter_defaults,
+        "vacuum_auto_fix": vacuum_auto_fix_defaults,
+        "spacegroup_filter": spacegroup_filter_defaults,
     }
 
     # 合并默认和用户设置
     settings_filters = settings.get("filters", {}) if isinstance(settings, dict) else {}
-    params = {**defaults, **{k: v for k, v in settings.items() if k != "filters"}}
+    params = {**defaults, **{k: v for k, v in settings.items() if k not in {"filters", "vacuum_filter", "vacuum_auto_fix", "spacegroup_filter"}}}
     params["filters"] = {**filter_defaults, **settings_filters}
+    params["vacuum_filter"] = {**vacuum_filter_defaults, **settings.get("vacuum_filter", {})}
+    params["vacuum_auto_fix"] = {**vacuum_auto_fix_defaults, **settings.get("vacuum_auto_fix", {})}
+    params["spacegroup_filter"] = {**spacegroup_filter_defaults, **settings.get("spacegroup_filter", {})}
 
     # 规范类型
     # symprec: 列表
@@ -534,6 +556,33 @@ def load_settings(config_path: str) -> argparse.Namespace:
     for key in ("enable_sqrt3", "enable_bond_scaling", "reject_if_overlap",
                 "debug_save_all_cands", "debug_save_rejected"):
         params[key] = as_bool(params.get(key))
+
+    params["filters"]["enable_min_distance_filter"] = as_bool(params["filters"].get("enable_min_distance_filter", True))
+    params["vacuum_filter"]["enable_vacuum_check"] = as_bool(params["vacuum_filter"].get("enable_vacuum_check", True))
+    params["vacuum_auto_fix"]["enable_auto_fix"] = as_bool(params["vacuum_auto_fix"].get("enable_auto_fix", True))
+    params["spacegroup_filter"]["enable_spacegroup_check_after_fix"] = as_bool(
+        params["spacegroup_filter"].get("enable_spacegroup_check_after_fix", True)
+    )
+
+    params["filters"]["min_interatomic_distance"] = float(params["filters"].get("min_interatomic_distance", 1.2))
+    params["vacuum_filter"]["min_vacuum_thickness_angstrom"] = float(
+        params["vacuum_filter"].get("min_vacuum_thickness_angstrom", 8.0)
+    )
+    params["vacuum_filter"]["vacuum_direction"] = str(params["vacuum_filter"].get("vacuum_direction", "c"))
+    params["vacuum_auto_fix"]["target_vacuum_thickness_angstrom"] = float(
+        params["vacuum_auto_fix"].get("target_vacuum_thickness_angstrom", 15.0)
+    )
+
+    sg_filter = params["spacegroup_filter"]
+    if sg_filter.get("target_spacegroup_number") is not None:
+        sg_filter["target_spacegroup_number"] = int(sg_filter["target_spacegroup_number"])
+    else:
+        sg_filter["target_spacegroup_number"] = None
+    if sg_filter.get("target_spacegroup_symbol") is not None:
+        sym = str(sg_filter["target_spacegroup_symbol"]).strip()
+        sg_filter["target_spacegroup_symbol"] = sym or None
+    sg_filter["symprec"] = float(sg_filter.get("symprec", 1e-3))
+    sg_filter["angle_tolerance"] = float(sg_filter.get("angle_tolerance", 5.0))
 
     # 数值
     params["bond_target_min"] = float(params["bond_target_min"])
@@ -762,8 +811,86 @@ def has_sufficient_vacuum(structure: Structure,
     return True, vacuum_thickness, detail
 
 
+def auto_fix_vacuum_with_pymatgen(structure: Structure,
+                                  target_vacuum: float,
+                                  direction: str = "c"):
+    """Stretch the lattice along *direction* so the vacuum layer reaches *target_vacuum*."""
+
+    if structure is None:
+        raise ValueError("structure must not be None for vacuum auto-fix")
+
+    target_vacuum = float(target_vacuum)
+    if target_vacuum <= 0:
+        return structure.copy(), 0.0
+
+    axis_idx = axis_to_index(direction)
+    lattice = structure.lattice
+    matrix = np.array(lattice.matrix, dtype=float)
+    axis_vec = matrix[axis_idx]
+    axis_norm = float(np.linalg.norm(axis_vec))
+    if axis_norm <= 1e-8:
+        raise ValueError(f"invalid lattice axis length {axis_norm:.4e} Å for direction {direction}")
+
+    frac_axis = np.array([site.frac_coords[axis_idx] for site in structure.sites], dtype=float)
+    occupy_span = _fractional_span(frac_axis)
+    occupied_thickness = occupy_span * axis_norm
+    new_axis_length = occupied_thickness + target_vacuum
+    if new_axis_length <= 1e-8:
+        raise ValueError("computed axis length after vacuum fix is non-positive")
+
+    axis_unit = axis_vec / axis_norm
+    new_matrix = matrix.copy()
+    new_matrix[axis_idx] = axis_unit * new_axis_length
+
+    cart_coords = np.array([site.coords for site in structure.sites], dtype=float)
+    new_lattice = Lattice(new_matrix)
+    new_frac = new_lattice.get_fractional_coords(cart_coords)
+    site_props = structure.site_properties or None
+    fixed_structure = Structure(
+        new_lattice,
+        [site.species for site in structure.sites],
+        new_frac,
+        coords_are_cartesian=False,
+        to_unit_cell=True,
+        site_properties=site_props,
+        validate_proximity=False,
+    )
+    _, new_vacuum, _ = has_sufficient_vacuum(fixed_structure, 0.0, direction)
+    return fixed_structure, new_vacuum
+
+
+def get_spacegroup_info(structure: Structure,
+                        symprec: float,
+                        angle_tolerance: float) -> Tuple[str, int]:
+    analyzer = SpacegroupAnalyzer(structure, symprec=symprec, angle_tolerance=angle_tolerance)
+    symbol = analyzer.get_space_group_symbol()
+    number = analyzer.get_space_group_number()
+    return symbol, number
+
+
+def is_spacegroup_acceptable(symbol: str,
+                             number: int,
+                             cfg: Optional[Dict[str, object]]) -> bool:
+    if not cfg:
+        return True
+
+    target_num = cfg.get("target_spacegroup_number")
+    target_sym = cfg.get("target_spacegroup_symbol")
+    if target_num is None and (target_sym is None or str(target_sym).strip() == ""):
+        return True
+
+    if target_num is not None and int(number) != int(target_num):
+        return False
+
+    if target_sym is not None:
+        if str(symbol).strip().lower() != str(target_sym).strip().lower():
+            return False
+
+    return True
+
+
 def is_structure_valid(structure: Structure, filters: Optional[Dict[str, object]] = None):
-    """Run fast structural filters before expensive evaluations."""
+    """Run fast structural filters (e.g., min-distance) before expensive evaluations."""
 
     filters = filters or {}
     try:
@@ -772,14 +899,6 @@ def is_structure_valid(structure: Structure, filters: Optional[Dict[str, object]
             has_close, close_details = has_too_close_atoms(structure, float(min_dist))
             if has_close:
                 reason = "atoms too close: " + "; ".join(close_details[:3])
-                return False, reason
-
-        if filters.get("enable_vacuum_filter", True):
-            min_vac = float(filters.get("min_vacuum_thickness", 8.0))
-            axis = filters.get("vacuum_axis", "c")
-            has_vacuum, vac_thickness, vac_detail = has_sufficient_vacuum(structure, min_vac, axis)
-            if not has_vacuum:
-                reason = "no sufficient vacuum: " + vac_detail
                 return False, reason
     except Exception as exc:
         return False, f"filter failure: {exc}"
@@ -1809,6 +1928,10 @@ def main():
     geom_filter = GeometryFilter(args, constraints, symprecs, slab_projector)
     evaluator = CandidateEvaluator(args, ref_stats, symprecs, (cn_lo, cn_hi), projector=slab_projector)
 
+    vacuum_filter_cfg = getattr(args, "vacuum_filter", {}) or {}
+    vacuum_fix_cfg = getattr(args, "vacuum_auto_fix", {}) or {}
+    spacegroup_filter_cfg = getattr(args, "spacegroup_filter", {}) or {}
+
     for idx, sg in enumerate(target_sgs, 1):
         sg_dir = makedirs(os.path.join(outdir, f"SG_{sg:03d}"))
         log_path = os.path.join(log_dir, f"SG_{sg:03d}.log")
@@ -1855,16 +1978,75 @@ def main():
             for cand_idx, st_raw in enumerate(cands, 1):
                 debug_save(st_raw, det2, 1.0, "raw")
 
-                is_valid, reason = is_structure_valid(st_raw, args.filters)
+                current_struct = st_raw
+
+                is_valid, reason = is_structure_valid(current_struct, args.filters)
                 if not is_valid:
                     append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  {reason}")
                     debug_save(st_raw, det2, 1.0, "filter_fail")
                     continue
 
-                pre_res = preprocessor.preprocess(st_raw)
+                vacuum_was_fixed = False
+                if vacuum_filter_cfg.get("enable_vacuum_check", True):
+                    min_vac = float(vacuum_filter_cfg.get("min_vacuum_thickness_angstrom", 8.0))
+                    axis = vacuum_filter_cfg.get("vacuum_direction", "c")
+                    axis_label = axis_index_to_label(axis_to_index(axis))
+                    has_vac, vac_thickness, vac_detail = has_sufficient_vacuum(current_struct, min_vac, axis)
+                    if not has_vac:
+                        if vacuum_fix_cfg.get("enable_auto_fix", False):
+                            target_vac = float(vacuum_fix_cfg.get("target_vacuum_thickness_angstrom", max(min_vac, 0.0)))
+                            try:
+                                fixed_struct, _ = auto_fix_vacuum_with_pymatgen(current_struct, target_vac, axis)
+                            except Exception as exc:
+                                append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  auto-fix vacuum failed: {exc}")
+                                debug_save(current_struct, det2, 1.0, "vacuum_fix_fail")
+                                continue
+
+                            has_vac, vac_thickness, vac_detail = has_sufficient_vacuum(fixed_struct, min_vac, axis)
+                            if not has_vac:
+                                append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  auto-fix vacuum insufficient: {vac_detail}")
+                                debug_save(fixed_struct, det2, 1.0, "vacuum_fix_fail")
+                                continue
+
+                            current_struct = fixed_struct
+                            vacuum_was_fixed = True
+                            append_log(
+                                log_path,
+                                (f"[FIX] det={det2} cand={cand_idx}  vacuum along {axis_label} fixed to "
+                                 f"{vac_thickness:.2f} Å (target {target_vac:.2f} Å)")
+                            )
+                        else:
+                            append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  no sufficient vacuum: {vac_detail}")
+                            debug_save(current_struct, det2, 1.0, "vacuum_fail")
+                            continue
+
+                if vacuum_was_fixed and spacegroup_filter_cfg.get("enable_spacegroup_check_after_fix", False):
+                    try:
+                        sg_symbol, sg_number = get_spacegroup_info(
+                            current_struct,
+                            spacegroup_filter_cfg.get("symprec", 1e-3),
+                            spacegroup_filter_cfg.get("angle_tolerance", 5.0),
+                        )
+                    except Exception as exc:
+                        append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  spacegroup check failed: {exc}")
+                        debug_save(current_struct, det2, 1.0, "spacegroup_fail")
+                        continue
+
+                    if not is_spacegroup_acceptable(sg_symbol, sg_number, spacegroup_filter_cfg):
+                        append_log(
+                            log_path,
+                            (f"[FILTER] det={det2} cand={cand_idx}  spacegroup mismatch after vacuum fix: "
+                             f"{sg_symbol} ({sg_number})"),
+                        )
+                        debug_save(current_struct, det2, 1.0, "spacegroup_fail")
+                        continue
+
+                    append_log(log_path, f"[KEEP] det={det2} cand={cand_idx}  spacegroup after vacuum fix: {sg_symbol} ({sg_number})")
+
+                pre_res = preprocessor.preprocess(current_struct)
                 if not pre_res.ok:
                     append_log(log_path, f"[REJ][prep] det={det2}  {pre_res.reason}")
-                    debug_save(pre_res.struct or st_raw, det2, pre_res.scale_ab, "prep_fail")
+                    debug_save(pre_res.struct or current_struct, det2, pre_res.scale_ab, "prep_fail")
                     continue
 
                 debug_save(pre_res.struct, det2, pre_res.scale_ab, "prepped")
