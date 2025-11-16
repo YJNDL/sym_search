@@ -8,8 +8,13 @@
     "cn_target": 4,
     "cn_range": [3, 6],
 
-    "vacuum_c": 20.0,
+    "vacuum_thickness": 20.0,
+    "vacuum_buffer": 1.0,
+    "layer_axis": "c",
+    "slab_center": 0.5,
+    "layer_thickness": 4.0,
     "layer_thickness_max": 5.0,
+    "reslab_after_relax": true,
 
     "z_flat_tol": 2.0,
     "surface_frac": 0.25,

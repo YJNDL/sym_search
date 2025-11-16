@@ -103,6 +103,25 @@ def as_bool(value) -> bool:
     return bool(value)
 
 
+def axis_to_index(value) -> int:
+    mapping = {
+        "a": 0, "x": 0, "0": 0, 0: 0,
+        "b": 1, "y": 1, "1": 1, 1: 1,
+        "c": 2, "z": 2, "2": 2, 2: 2,
+    }
+    if isinstance(value, str):
+        key = value.strip().lower()
+    else:
+        key = value
+    if key in mapping:
+        return mapping[key]
+    raise ValueError(f"layer_axis 不支持 {value!r}，请使用 a/b/c 或 x/y/z")
+
+
+def axis_index_to_label(axis: int) -> str:
+    return {0: "a", 1: "b", 2: "c"}.get(axis, "c")
+
+
 def parse_pair_distance_matrix(raw) -> Dict[Tuple[str, str], float]:
     matrix: Dict[Tuple[str, str], float] = {}
     if not raw:
@@ -409,7 +428,8 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "outdir": "out",
 
         "bond_tol": 0.4,
-        "vacuum_c": 20.0,
+        "vacuum_thickness": 20.0,
+        "vacuum_buffer": 1.0,
 
         "det_max": 12,
         "max_atoms": 96,
@@ -440,7 +460,11 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "seed": 2025,
 
         # 目标原子层最大整体厚度（Å），>0 时会主动压扁 z 分布
+        "layer_thickness": None,
         "layer_thickness_max": 3.0,
+        "layer_axis": "c",
+        "slab_center": 0.5,
+        "reslab_after_relax": True,
 
         # 用于最近邻统计和 CN 的元素对（可以改成任意中心/邻居元素）
         "center_species": "Ga",
@@ -506,12 +530,28 @@ def load_settings(config_path: str) -> argparse.Namespace:
     params["min_bond_length_factor"] = float(params.get("min_bond_length_factor", 0.9))
     params["hard_sphere_radius_scale"] = float(params.get("hard_sphere_radius_scale", 0.95))
     params["motif_overlap_tol"] = float(params.get("motif_overlap_tol", 0.25))
-    params["vacuum_c"] = float(params["vacuum_c"])
+    if "vacuum_thickness" not in params and "vacuum_c" in params:
+        params["vacuum_thickness"] = params["vacuum_c"]
+    params["vacuum_thickness"] = float(params.get("vacuum_thickness", 20.0))
+    if params["vacuum_thickness"] <= 0:
+        raise ValueError("vacuum_thickness 必须为正数，才能形成二维层状结构")
+    params["vacuum_buffer"] = float(params.get("vacuum_buffer", 1.0))
     params["z_flat_tol"] = float(params["z_flat_tol"])
+    layer_thickness = params.get("layer_thickness")
+    if layer_thickness is None:
+        params["layer_thickness"] = None
+    else:
+        layer_val = float(layer_thickness)
+        params["layer_thickness"] = layer_val if layer_val > 0 else None
+
     params["layer_thickness_max"] = float(params["layer_thickness_max"])
+    params["slab_center"] = float(params.get("slab_center", 0.5))
     params["w_cost_d"] = float(params["w_cost_d"])
     params["w_cost_cn"] = float(params["w_cost_cn"])
     params["surface_frac"] = float(params["surface_frac"])
+    params["layer_axis"] = str(params.get("layer_axis", "c"))
+    params["layer_axis_index"] = axis_to_index(params["layer_axis"])
+    params["reslab_after_relax"] = as_bool(params.get("reslab_after_relax", True))
 
     params["bond_scaling_mode"] = str(params.get("bond_scaling_mode", "soft")).lower()
     params["bond_coverage_min"] = float(params.get("bond_coverage_min", 0.8))
@@ -547,18 +587,94 @@ def load_settings(config_path: str) -> argparse.Namespace:
 
 # ------------------------------ 几何与邻接（通用元素版） ------------------------------
 
-def ensure_vacuum_c(struct: Structure, c_target_low=18.0, c_target_high=25.0) -> Structure:
-    """
-    只调整 c 长度至给定范围，不改变 a,b 与角度，保持 z 分数坐标不变。
-    """
-    L = struct.lattice
-    c = L.c
-    if c_target_low <= c <= c_target_high:
+def ensure_vacuum_axis(struct: Structure,
+                       axis_index: int = 2,
+                       target: float = 20.0,
+                       buffer: float = 1.0) -> Structure:
+    """Adjust the lattice vector *axis_index* so it provides the desired vacuum."""
+
+    if target <= 0:
         return struct.copy()
-    c_new = max(min(c, c_target_high), c_target_low)
-    L_new = Lattice.from_parameters(L.a, L.b, c_new, L.alpha, L.beta, L.gamma)
-    return Structure(L_new, [s.species for s in struct.sites],
-                     [s.frac_coords for s in struct.sites], coords_are_cartesian=False)
+
+    lattice = struct.lattice
+    matrix = lattice.matrix.copy()
+    axis_vec = matrix[axis_index]
+    current = np.linalg.norm(axis_vec)
+    lo = target - max(buffer, 0.0)
+    hi = target + max(buffer, 0.0)
+    if lo <= current <= hi and current > 0:
+        return struct.copy()
+
+    if current <= 0:
+        direction = np.zeros(3)
+        direction[axis_index] = 1.0
+    else:
+        direction = axis_vec / current
+    matrix[axis_index] = direction * target
+    new_lattice = Lattice(matrix)
+    return Structure(new_lattice,
+                     [s.species for s in struct.sites],
+                     [s.frac_coords for s in struct.sites],
+                     coords_are_cartesian=False)
+
+
+def ensure_vacuum_c(struct: Structure, c_target_low=18.0, c_target_high=25.0) -> Structure:
+    target = 0.5 * (c_target_low + c_target_high)
+    buffer = max(target - c_target_low, c_target_high - target)
+    return ensure_vacuum_axis(struct, axis_index=2, target=target, buffer=buffer)
+
+
+def orthogonalize_lattice_to_axis(struct: Structure, axis_index: int = 2) -> Structure:
+    """Remove the component of in-plane lattice vectors along the slab normal."""
+
+    lattice = struct.lattice
+    mat = np.array(lattice.matrix, dtype=float)
+    axis_vec = mat[axis_index]
+    axis_norm = np.linalg.norm(axis_vec)
+    if axis_norm <= 1e-8:
+        axis_vec = np.zeros(3)
+        axis_vec[axis_index] = 1.0
+        axis_norm = 1.0
+    axis_unit = axis_vec / axis_norm
+
+    for idx in range(3):
+        if idx == axis_index:
+            continue
+        vec = mat[idx]
+        vec_proj = vec - np.dot(vec, axis_unit) * axis_unit
+        if np.linalg.norm(vec_proj) <= 1e-8:
+            basis = np.zeros(3)
+            basis[(idx + 1) % 3] = 1.0
+            vec_proj = basis - np.dot(basis, axis_unit) * axis_unit
+        mat[idx] = vec_proj
+
+    mat[axis_index] = axis_unit * axis_norm
+    new_lattice = Lattice(mat)
+    return Structure(new_lattice,
+                     [s.species for s in struct.sites],
+                     struct.cart_coords,
+                     coords_are_cartesian=True)
+
+
+def set_axis_length(struct: Structure, axis_index: int, target: float) -> Structure:
+    """Rescale a lattice vector while keeping fractional coordinates fixed."""
+
+    if target <= 0:
+        return struct
+
+    mat = np.array(struct.lattice.matrix, dtype=float)
+    axis_vec = mat[axis_index]
+    axis_norm = np.linalg.norm(axis_vec)
+    if axis_norm <= 1e-8:
+        axis_vec = np.zeros(3)
+        axis_vec[axis_index] = 1.0
+        axis_norm = 1.0
+    mat[axis_index] = axis_vec / axis_norm * target
+    new_lattice = Lattice(mat)
+    return Structure(new_lattice,
+                     [s.species for s in struct.sites],
+                     [s.frac_coords for s in struct.sites],
+                     coords_are_cartesian=False)
 
 
 def min_image_vec(frac_delta):
@@ -759,16 +875,17 @@ def min_any_pair_distance(struct: Structure) -> float:
     return float(dmin)
 
 
-def layer_thickness_angstrom(struct: Structure) -> float:
-    """
-    整体层厚度：z 方向上 max(z) - min(z)（Å）。
-    """
-    c = struct.lattice.c
-    zs = np.array([s.frac_coords[2] * c for s in struct.sites])
-    return float(np.ptp(zs))
+def layer_thickness_angstrom(struct: Structure, axis_index: int = 2) -> float:
+    """Return the slab thickness (Å) along the selected axis."""
+
+    axis_len = struct.lattice.lengths[axis_index]
+    coords = np.array([s.frac_coords[axis_index] * axis_len for s in struct.sites])
+    return float(np.ptp(coords))
 
 
-def surface_corrugation_angstrom(struct: Structure, surface_frac: float = 0.25):
+def surface_corrugation_angstrom(struct: Structure,
+                                 surface_frac: float = 0.25,
+                                 axis_index: int = 2):
     """
     估算“表面起伏”：
     - 先取所有原子的 z_cart，得到总厚度 thickness。
@@ -778,9 +895,8 @@ def surface_corrugation_angstrom(struct: Structure, surface_frac: float = 0.25):
 
     返回 (corrugation, thickness)，单位 Å。
     """
-    L = struct.lattice
-    c = L.c
-    z_cart = np.array([s.frac_coords[2] * c for s in struct.sites])
+    axis_len = struct.lattice.lengths[axis_index]
+    z_cart = np.array([s.frac_coords[axis_index] * axis_len for s in struct.sites])
     z_min = float(z_cart.min())
     z_max = float(z_cart.max())
     thickness = z_max - z_min
@@ -797,42 +913,53 @@ def surface_corrugation_angstrom(struct: Structure, surface_frac: float = 0.25):
     return max(corr_top, corr_bot), thickness
 
 
-def squash_layer_thickness(struct: Structure, max_thickness: float) -> Structure:
-    """
-    将结构中原子在 z 方向的整体厚度压缩到不超过 max_thickness（Å）。
-    只改变原子 z 分数坐标，不改变 a,b,c 和角度。
-    如果 max_thickness<=0 或者原本就比它薄，则直接返回原结构。
-    """
-    if max_thickness is None or max_thickness <= 0:
+def squash_layer_thickness(struct: Structure,
+                           max_thickness: float,
+                           axis_index: int = 2,
+                           target_center: Optional[float] = 0.5,
+                           target_thickness: Optional[float] = None) -> Structure:
+    """Compress atoms into a thin slab along the selected axis."""
+
+    axis_len = struct.lattice.lengths[axis_index]
+    if axis_len <= 0:
         return struct
 
-    L = struct.lattice
-    c = L.c
-    z_cart = np.array([s.frac_coords[2] * c for s in struct.sites])
-    z_min = float(z_cart.min())
-    z_max = float(z_cart.max())
+    coords = np.array([s.frac_coords for s in struct.sites], dtype=float)
+    axis_cart = coords[:, axis_index] * axis_len
+    if axis_cart.size == 0:
+        return struct
+
+    z_min = float(axis_cart.min())
+    z_max = float(axis_cart.max())
     thickness = z_max - z_min
+    if thickness < 1e-9:
+        thickness = 0.0
 
-    if thickness < 1e-6 or thickness <= max_thickness:
-        return struct
+    scale = 1.0
+    if target_thickness is not None and target_thickness > 0 and thickness > 0:
+        scale = target_thickness / thickness
+    elif max_thickness is not None and max_thickness > 0 and thickness > max_thickness:
+        scale = max_thickness / thickness
 
-    z_mid = 0.5 * (z_max + z_min)
-    scale = max_thickness / thickness
+    mid_current = 0.5 * (z_max + z_min)
+    if target_center is None:
+        target_mid = mid_current
+    else:
+        frac_center = float(target_center)
+        target_mid = frac_center * axis_len
 
     new_frac = []
-    for s in struct.sites:
-        fc = np.array(s.frac_coords, dtype=float)
-        zc = fc[2] * c
-        zc_new = (zc - z_mid) * scale + z_mid
-        fc[2] = zc_new / c
-        new_frac.append(fc)
+    for fc in coords:
+        axis_val = fc[axis_index] * axis_len
+        axis_new = (axis_val - mid_current) * scale + target_mid
+        fc_new = fc.copy()
+        fc_new[axis_index] = (axis_new / axis_len) % 1.0
+        new_frac.append(fc_new)
 
-    return Structure(
-        L,
-        [s.species for s in struct.sites],
-        new_frac,
-        coords_are_cartesian=False
-    )
+    return Structure(struct.lattice,
+                     [s.species for s in struct.sites],
+                     new_frac,
+                     coords_are_cartesian=False)
 
 
 def candidate_cost(struct: Structure,
@@ -1007,31 +1134,85 @@ class CandidateGenerator:
         )
 
 
-class CandidatePreprocessor:
-    def __init__(self, args):
-        self.args = args
+class SlabProjector:
+    """Utility object that enforces the 2D slab geometry."""
 
-    def preprocess(self, struct: Structure) -> PreprocessResult:
-        st = ensure_vacuum_c(
-            struct,
-            c_target_low=self.args.vacuum_c - 1.0,
-            c_target_high=self.args.vacuum_c + 1.0,
+    def __init__(self, args):
+        self.axis_index = int(getattr(args, "layer_axis_index", 2))
+        self.axis_label = axis_index_to_label(self.axis_index)
+        self.vacuum_target = float(getattr(args, "vacuum_thickness", 20.0))
+        self.vacuum_buffer = float(getattr(args, "vacuum_buffer", 1.0))
+        self.layer_thickness = getattr(args, "layer_thickness", None)
+        self.layer_thickness_max = float(getattr(args, "layer_thickness_max", 0.0))
+        self.surface_frac = float(getattr(args, "surface_frac", 0.25))
+        self.slab_center = float(getattr(args, "slab_center", 0.5))
+
+    def project(self, struct: Structure, with_metrics: bool = False):
+        st = orthogonalize_lattice_to_axis(struct, axis_index=self.axis_index)
+        raw_thickness = max(layer_thickness_angstrom(st, axis_index=self.axis_index), 1e-6)
+        target_layer = raw_thickness
+        if self.layer_thickness and self.layer_thickness > 0:
+            target_layer = self.layer_thickness
+        elif self.layer_thickness_max > 0 and raw_thickness > self.layer_thickness_max:
+            target_layer = self.layer_thickness_max
+        target_layer = max(target_layer, 1e-3)
+
+        st = squash_layer_thickness(
+            st,
+            max_thickness=target_layer,
+            axis_index=self.axis_index,
+            target_center=self.slab_center,
+            target_thickness=target_layer,
         )
-        st = squash_layer_thickness(st, self.args.layer_thickness_max)
+        total_axis = target_layer + self.vacuum_target
+        buffer = max(self.vacuum_buffer, 0.0)
+        if buffer > 0:
+            total_axis += buffer
+        st = set_axis_length(st, self.axis_index, total_axis)
+        st = squash_layer_thickness(
+            st,
+            max_thickness=target_layer,
+            axis_index=self.axis_index,
+            target_center=self.slab_center,
+            target_thickness=target_layer,
+        )
 
         metrics: Dict[str, object] = {}
-        surf_corr, thickness = surface_corrugation_angstrom(st, surface_frac=self.args.surface_frac)
-        metrics["z_surf_corr"] = surf_corr
-        metrics["z_thickness"] = thickness
+        corr, thickness = surface_corrugation_angstrom(
+            st,
+            surface_frac=self.surface_frac,
+            axis_index=self.axis_index,
+        )
+        metrics.update({
+            "z_surf_corr": corr,
+            "z_thickness": thickness,
+            "layer_axis": self.axis_label,
+            "layer_target": target_layer,
+            "vacuum_gap": self.vacuum_target,
+            "axis_length_total": total_axis,
+        })
+        if not with_metrics:
+            metrics = {}
+        return st, metrics
 
-        if self.args.layer_thickness_max > 0 and thickness > self.args.layer_thickness_max + 1e-3:
+
+class CandidatePreprocessor:
+    def __init__(self, args, projector: SlabProjector):
+        self.args = args
+        self.projector = projector
+
+    def preprocess(self, struct: Structure) -> PreprocessResult:
+        st, slab_metrics = self.projector.project(struct, with_metrics=True)
+        metrics: Dict[str, object] = dict(slab_metrics)
+
+        if self.args.layer_thickness_max > 0 and metrics.get("z_thickness", 0.0) > self.args.layer_thickness_max + 1e-3:
             return PreprocessResult(False, struct=st, reason=(
-                f"thickness={thickness:.3f}Å > layer_thickness_max={self.args.layer_thickness_max:.3f}Å"
+                f"thickness={metrics['z_thickness']:.3f}Å > layer_thickness_max={self.args.layer_thickness_max:.3f}Å"
             ), metrics=metrics)
 
-        if surf_corr > self.args.z_flat_tol:
+        if metrics.get("z_surf_corr", 0.0) > self.args.z_flat_tol:
             return PreprocessResult(False, struct=st, reason=(
-                f"surface_corr={surf_corr:.3f}Å > z_flat_tol={self.args.z_flat_tol:.3f}Å"
+                f"surface_corr={metrics['z_surf_corr']:.3f}Å > z_flat_tol={self.args.z_flat_tol:.3f}Å"
             ), metrics=metrics)
 
         try:
@@ -1152,10 +1333,15 @@ class CandidatePreprocessor:
 
 
 class GeometryFilter:
-    def __init__(self, args, constraints: GeometryConstraints, symprecs: Sequence[float]):
+    def __init__(self,
+                 args,
+                 constraints: GeometryConstraints,
+                 symprecs: Sequence[float],
+                 projector: Optional[SlabProjector] = None):
         self.args = args
         self.constraints = constraints
         self.symprecs = tuple(symprecs)
+        self.projector = projector
 
     def filter(self, struct: Structure) -> FilterResult:
         report = self.constraints.analyze_pairs(struct)
@@ -1167,6 +1353,8 @@ class GeometryFilter:
         }
 
         st = struct
+        if self.projector and getattr(self.args, "reslab_after_relax", True):
+            st, _ = self.projector.project(st, with_metrics=False)
         if report.violations:
             relax_cfg = getattr(self.args, "post_gen_relax", {}) or {}
             if relax_cfg.get("mode") == "hard_sphere":
@@ -1176,6 +1364,8 @@ class GeometryFilter:
                     max_iter=relax_cfg.get("max_iter", 30),
                     step=relax_cfg.get("step", 0.4),
                 )
+                if self.projector and getattr(self.args, "reslab_after_relax", True):
+                    relaxed, _ = self.projector.project(relaxed, with_metrics=False)
                 st = relaxed
                 report = self.constraints.analyze_pairs(st)
                 metrics["relax"] = {
@@ -1192,6 +1382,31 @@ class GeometryFilter:
                 return FilterResult(False, struct=st, reason=reason, metrics=metrics)
 
         metrics["pair_min_after"] = report.min_distance
+
+        if self.projector:
+            corr, thickness = surface_corrugation_angstrom(
+                st,
+                surface_frac=self.projector.surface_frac,
+                axis_index=self.projector.axis_index,
+            )
+            metrics["z_surf_corr_post"] = corr
+            metrics["z_thickness_post"] = thickness
+            if self.args.layer_thickness_max > 0 and thickness > self.args.layer_thickness_max + 1e-3:
+                return FilterResult(
+                    False,
+                    struct=st,
+                    reason=(
+                        f"thickness={thickness:.3f}Å > layer_thickness_max={self.args.layer_thickness_max:.3f}Å"
+                    ),
+                    metrics=metrics,
+                )
+            if corr > self.args.z_flat_tol:
+                return FilterResult(
+                    False,
+                    struct=st,
+                    reason=f"surface_corr={corr:.3f}Å > z_flat_tol={self.args.z_flat_tol:.3f}Å",
+                    metrics=metrics,
+                )
 
         density = float(st.density)
         metrics["density"] = density
@@ -1223,11 +1438,17 @@ class GeometryFilter:
 
 
 class CandidateEvaluator:
-    def __init__(self, args, ref_stats: dict, symprecs: Sequence[float], cn_range: Tuple[int, int]):
+    def __init__(self,
+                 args,
+                 ref_stats: dict,
+                 symprecs: Sequence[float],
+                 cn_range: Tuple[int, int],
+                 projector: Optional[SlabProjector] = None):
         self.args = args
         self.ref_stats = ref_stats
         self.symprecs = tuple(symprecs)
         self.cn_lo, self.cn_hi = cn_range
+        self.projector = projector
 
     def evaluate(self,
                  struct: Structure,
@@ -1262,6 +1483,9 @@ class CandidateEvaluator:
             return EvaluatorResult(False, reason=f"识别空间群={sg_found} != 目标 SG={sg_target}")
 
         prim = to_primitive(struct, symprec=sym_used or self.symprecs[0], angle_tolerance=self.args.angle_tol)
+        slab_metrics: Dict[str, object] = {}
+        if self.projector is not None:
+            prim, slab_metrics = self.projector.project(prim, with_metrics=True)
 
         meta = dict(base_meta)
         meta.update({
@@ -1275,6 +1499,8 @@ class CandidateEvaluator:
             "cost_stats": cost_stats,
             "n_atoms": len(prim),
         })
+        if slab_metrics:
+            meta.update(slab_metrics)
         if "z_thickness" in meta and "z_ptp" not in meta:
             meta["z_ptp"] = meta["z_thickness"]
 
@@ -1370,7 +1596,8 @@ def main():
     if not os.path.exists(args.structure_file):
         raise FileNotFoundError(f"结构文件不存在: {args.structure_file}")
     base = Structure.from_file(args.structure_file)
-    base = ensure_vacuum_c(base, c_target_low=args.vacuum_c - 1.0, c_target_high=args.vacuum_c + 1.0)
+    slab_projector = SlabProjector(args)
+    base, _ = slab_projector.project(base, with_metrics=False)
 
     # 用用户指定的元素对做参考最近邻统计
     ref_stats = compute_nn_stats(
@@ -1437,9 +1664,9 @@ def main():
 
     constraints = GeometryConstraints(args)
     generator = CandidateGenerator(args)
-    preprocessor = CandidatePreprocessor(args)
-    geom_filter = GeometryFilter(args, constraints, symprecs)
-    evaluator = CandidateEvaluator(args, ref_stats, symprecs, (cn_lo, cn_hi))
+    preprocessor = CandidatePreprocessor(args, slab_projector)
+    geom_filter = GeometryFilter(args, constraints, symprecs, slab_projector)
+    evaluator = CandidateEvaluator(args, ref_stats, symprecs, (cn_lo, cn_hi), projector=slab_projector)
 
     for idx, sg in enumerate(target_sgs, 1):
         sg_dir = makedirs(os.path.join(outdir, f"SG_{sg:03d}"))

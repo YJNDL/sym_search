@@ -48,6 +48,18 @@
    - 计算层密度、motif 包络（基于等价原子 & 硬球半径），若 `reject_if_overlap=true` 则直接丢弃重叠或过密结构。
 3. **评分 (`CandidateEvaluator`)**：只在通过几何过滤后计算 cost、配位数，并用 spglib 验证空间群，最后去重、写出结构。
 
+### 2D slab 几何控制
+为了确保候选结构始终是“二维薄片 + 真空层”，脚本新增了专门的 slab 控制器：
+
+- `vacuum_thickness` / `vacuum_buffer`：把 `layer_axis` 对应的晶格矢量直接拉伸到 `layer_thickness + vacuum_thickness (+ vacuum_buffer)` 的长度，`vacuum_buffer` 相当于额外的保护间隙。这样无论 pyxtal 生成怎样的 3D 晶格，都会被统一成“in-plane 周期 + 固定真空”的单轴晶胞。
+- `layer_thickness`：可选的“目标层厚”，一旦设置，所有候选都会被压缩/拉伸到该绝对厚度，再在其外侧追加 `vacuum_thickness` 指定的真空。若留空，则默认保留原始厚度，只在超过 `layer_thickness_max` 时才压缩。
+- `layer_thickness_max`：当 `layer_thickness` 未设置时，作为薄片厚度的上限。若希望只做重心对齐，可把该值设为 0 并单独调 `slab_center`。
+- `slab_center`：薄片在真空方向上的中心位置（分数坐标，默认 0.5，对应居中真空）。
+- `layer_axis`：指定哪条晶轴作为“法向 + 真空方向”（支持 `a/b/c` 或 `x/y/z`）。
+- `reslab_after_relax`：若开启硬球松弛，松弛后的结构也会自动重新投影回薄片，以防 3D bulk 重新出现。
+
+这些参数由 `SlabProjector` 统一处理：它会先把原始晶格在法向方向上正交化，再根据 `layer_thickness`/`layer_thickness_max` 重建薄片厚度，并在外侧追加指定的真空。`CandidatePreprocessor`、`GeometryFilter` 和 `CandidateEvaluator`（保存最终原胞前）都会调用该投影器，因此任何生成、松弛或转原胞操作之后，结构都会重新回到“二维薄片 + 真空”的几何形态，调试目录和最终输出都会反映这一点。
+
 可以在 `config.json` 中调节下列关键参数：
 
 - `min_pair_dist_matrix`：元素对最小距离矩阵。既支持 `{"Ga-Sb": 2.3}` 这样的扁平键值，也支持嵌套写法：
