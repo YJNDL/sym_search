@@ -183,6 +183,35 @@ class EvaluatorResult:
 
 
 @dataclass
+class SlabValidationResult:
+    ok: bool
+    reason: Optional[str] = None
+    metrics: Dict[str, object] = field(default_factory=dict)
+
+
+def record_slab_validation(metrics: Dict[str, object],
+                           stage: str,
+                           result: SlabValidationResult,
+                           final: bool = False):
+    """Record slab validation metadata under *metrics*."""
+
+    if not stage:
+        stage = "default"
+    stage_map = metrics.setdefault("slab_validation", {})
+    stage_map[stage] = {
+        **result.metrics,
+        "ok": result.ok,
+        "reason": result.reason,
+    }
+    if final or "is_2d_valid" not in metrics:
+        metrics["is_2d_valid"] = result.ok
+        if result.ok:
+            metrics.pop("is_2d_reason", None)
+        else:
+            metrics["is_2d_reason"] = result.reason
+
+
+@dataclass
 class LocalEnvRule:
     species: Optional[Tuple[str, ...]]
     cn_range: Tuple[float, float]
@@ -733,6 +762,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "bond_tol": 0.4,
         "vacuum_thickness": 20.0,
         "vacuum_buffer": 1.0,
+        "min_vacuum_thickness": None,
 
         "det_max": 12,
         "max_atoms": 96,
@@ -767,6 +797,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "layer_thickness_max": 3.0,
         "layer_axis": "c",
         "slab_center": 0.5,
+        "slab_center_tol": 0.02,
         "reslab_after_relax": True,
 
         # 用于最近邻统计和 CN 的元素对（可以改成任意中心/邻居元素）
@@ -841,6 +872,11 @@ def load_settings(config_path: str) -> argparse.Namespace:
     if params["vacuum_thickness"] <= 0:
         raise ValueError("vacuum_thickness 必须为正数，才能形成二维层状结构")
     params["vacuum_buffer"] = float(params.get("vacuum_buffer", 1.0))
+    min_vac = params.get("min_vacuum_thickness")
+    if min_vac is None:
+        params["min_vacuum_thickness"] = params["vacuum_thickness"]
+    else:
+        params["min_vacuum_thickness"] = float(min_vac)
     params["z_flat_tol"] = float(params["z_flat_tol"])
     layer_thickness = params.get("layer_thickness")
     if layer_thickness is None:
@@ -851,6 +887,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
 
     params["layer_thickness_max"] = float(params["layer_thickness_max"])
     params["slab_center"] = float(params.get("slab_center", 0.5))
+    params["slab_center_tol"] = float(params.get("slab_center_tol", 0.02))
     params["w_cost_d"] = float(params["w_cost_d"])
     params["w_cost_cn"] = float(params["w_cost_cn"])
     params["surface_frac"] = float(params["surface_frac"])
@@ -1190,6 +1227,101 @@ def layer_thickness_angstrom(struct: Structure, axis_index: int = 2) -> float:
     return float(np.ptp(coords))
 
 
+def _normalize_layer_axis(layer_axis) -> Tuple[int, float]:
+    center = 0.5
+    axis_val = layer_axis
+    if isinstance(layer_axis, (tuple, list)):
+        if layer_axis:
+            axis_val = layer_axis[0]
+        if len(layer_axis) > 1 and layer_axis[1] is not None:
+            center = float(layer_axis[1])
+    axis_index = axis_to_index(axis_val)
+    center = float(center)
+    if not math.isfinite(center):
+        center = 0.5
+    center = center % 1.0
+    return axis_index, center
+
+
+def is_2d_structure(struct: Structure,
+                    layer_axis,
+                    max_layer_thickness: Optional[float],
+                    min_vacuum_thickness: Optional[float],
+                    slab_center_tol: float) -> SlabValidationResult:
+    """Validate whether *struct* already represents a single 2D slab."""
+
+    if struct is None:
+        return SlabValidationResult(False, reason="结构为空")
+
+    axis_index, slab_center = _normalize_layer_axis(layer_axis)
+    axis_len = float(struct.lattice.lengths[axis_index])
+    if axis_len <= 1e-8:
+        return SlabValidationResult(
+            False,
+            reason=f"轴 {axis_index_to_label(axis_index)} 长度 {axis_len:.4f}Å 非法",
+            metrics={"slab_axis_length": axis_len},
+        )
+
+    coords = np.array([s.frac_coords[axis_index] for s in struct.sites], dtype=float)
+    if coords.size == 0:
+        slab_min = slab_max = 0.0
+    else:
+        rel = ((coords - slab_center + 0.5) % 1.0) - 0.5
+        rel_cart = rel * axis_len
+        slab_min = float(rel_cart.min())
+        slab_max = float(rel_cart.max())
+
+    slab_thickness = max(0.0, slab_max - slab_min)
+    vacuum_thickness = max(0.0, axis_len - slab_thickness)
+    center_offset_cart = 0.5 * (slab_max + slab_min)
+    center_offset_frac = center_offset_cart / axis_len
+    actual_center = (slab_center + center_offset_frac) % 1.0
+
+    metrics = {
+        "slab_axis_index": axis_index,
+        "slab_axis_label": axis_index_to_label(axis_index),
+        "slab_axis_length": axis_len,
+        "slab_thickness": slab_thickness,
+        "slab_vacuum": vacuum_thickness,
+        "slab_center_target": slab_center,
+        "slab_center_actual": actual_center,
+        "slab_center_offset": center_offset_frac,
+    }
+
+    tol = 1e-3
+    if max_layer_thickness is not None and max_layer_thickness > 0:
+        if slab_thickness > max_layer_thickness + tol:
+            return SlabValidationResult(
+                False,
+                reason=(
+                    f"厚度 {slab_thickness:.3f}Å 超出上限 {max_layer_thickness:.3f}Å"
+                ),
+                metrics=metrics,
+            )
+
+    if min_vacuum_thickness is not None and min_vacuum_thickness > 0:
+        if vacuum_thickness + tol < min_vacuum_thickness:
+            return SlabValidationResult(
+                False,
+                reason=(
+                    f"真空厚度 {vacuum_thickness:.3f}Å < 要求 {min_vacuum_thickness:.3f}Å"
+                ),
+                metrics=metrics,
+            )
+
+    if slab_center_tol is not None and slab_center_tol > 0:
+        if abs(center_offset_frac) > slab_center_tol + 1e-5:
+            return SlabValidationResult(
+                False,
+                reason=(
+                    f"层中心偏移 {center_offset_frac:.4f} 超出 tol={slab_center_tol:.4f}"
+                ),
+                metrics=metrics,
+            )
+
+    return SlabValidationResult(True, metrics=metrics)
+
+
 def surface_corrugation_angstrom(struct: Structure,
                                  surface_frac: float = 0.25,
                                  axis_index: int = 2):
@@ -1513,10 +1645,19 @@ class CandidatePreprocessor:
         self.projector = projector
         self.constraints = constraints
         self.local_env_checker = local_env_checker
+        self._layer_axis = (self.projector.axis_index if self.projector else axis_to_index(args.layer_axis),
+                            float(getattr(args, "slab_center", 0.5)))
+        self._min_vacuum = float(getattr(args, "min_vacuum_thickness", getattr(args, "vacuum_thickness", 0.0)))
+        self._slab_center_tol = float(getattr(args, "slab_center_tol", 0.02))
 
     def preprocess(self, struct: Structure) -> PreprocessResult:
         st, slab_metrics = self.projector.project(struct, with_metrics=True)
         metrics: Dict[str, object] = dict(slab_metrics)
+
+        slab_check = self._validate_slab(st, metrics, stage="preprocessor", final=True)
+        if not slab_check.ok:
+            reason = slab_check.reason or "未通过二维 slab 校验"
+            return PreprocessResult(False, struct=st, reason=f"2D 几何无效: {reason}", metrics=metrics)
 
         if self.args.layer_thickness_max > 0 and metrics.get("z_thickness", 0.0) > self.args.layer_thickness_max + 1e-3:
             return PreprocessResult(False, struct=st, reason=(
@@ -1578,6 +1719,21 @@ class CandidatePreprocessor:
             if not env_check.ok:
                 return PreprocessResult(False, struct=scaled, reason=f"local_env: {env_check.reason}", metrics=metrics)
         return PreprocessResult(True, struct=scaled, scale_ab=scale, metrics=metrics)
+
+    def _validate_slab(self, struct: Structure, metrics: Dict[str, object], stage: str, final: bool = False):
+        if not self.projector:
+            result = SlabValidationResult(True, metrics={})
+            record_slab_validation(metrics, stage, result, final=final)
+            return result
+        result = is_2d_structure(
+            struct,
+            layer_axis=self._layer_axis,
+            max_layer_thickness=self.args.layer_thickness_max,
+            min_vacuum_thickness=self._min_vacuum,
+            slab_center_tol=self._slab_center_tol,
+        )
+        record_slab_validation(metrics, stage, result, final=final)
+        return result
 
     def _local_env_metrics(self, struct: Structure) -> Optional[LocalEnvReport]:
         if not self.local_env_checker:
@@ -1706,6 +1862,10 @@ class GeometryFilter:
         self.constraints = constraints
         self.symprecs = tuple(symprecs)
         self.projector = projector
+        self._layer_axis = (self.projector.axis_index if self.projector else axis_to_index(args.layer_axis),
+                            float(getattr(args, "slab_center", 0.5)))
+        self._min_vacuum = float(getattr(args, "min_vacuum_thickness", getattr(args, "vacuum_thickness", 0.0)))
+        self._slab_center_tol = float(getattr(args, "slab_center_tol", 0.02))
 
     def filter(self, struct: Structure) -> FilterResult:
         report = self.constraints.analyze_pairs(struct)
@@ -1718,7 +1878,13 @@ class GeometryFilter:
 
         st = struct
         if self.projector and getattr(self.args, "reslab_after_relax", True):
+            pre_val = self._validate_slab(st, metrics, stage="geom_pre_reslab", final=False)
+            if not pre_val.ok:
+                return FilterResult(False, struct=st, reason=f"2D 几何无效: {pre_val.reason}", metrics=metrics)
             st, _ = self.projector.project(st, with_metrics=False)
+            post_val = self._validate_slab(st, metrics, stage="geom_post_reslab_init", final=False)
+            if not post_val.ok:
+                return FilterResult(False, struct=st, reason=f"2D 几何无效: {post_val.reason}", metrics=metrics)
         if report.violations:
             relax_cfg = getattr(self.args, "post_gen_relax", {}) or {}
             if relax_cfg.get("mode") == "hard_sphere":
@@ -1729,7 +1895,13 @@ class GeometryFilter:
                     step=relax_cfg.get("step", 0.4),
                 )
                 if self.projector and getattr(self.args, "reslab_after_relax", True):
+                    post_relax_val = self._validate_slab(relaxed, metrics, stage="geom_post_relax", final=False)
+                    if not post_relax_val.ok:
+                        return FilterResult(False, struct=relaxed, reason=f"2D 几何无效: {post_relax_val.reason}", metrics=metrics)
                     relaxed, _ = self.projector.project(relaxed, with_metrics=False)
+                    post_relax_reslab = self._validate_slab(relaxed, metrics, stage="geom_post_relax_reslab", final=False)
+                    if not post_relax_reslab.ok:
+                        return FilterResult(False, struct=relaxed, reason=f"2D 几何无效: {post_relax_reslab.reason}", metrics=metrics)
                 st = relaxed
                 report = self.constraints.analyze_pairs(st)
                 metrics["relax"] = {
@@ -1798,7 +1970,26 @@ class GeometryFilter:
         if overlap_flag and self.constraints.reject_if_overlap:
             return FilterResult(False, struct=st, reason="motif 重叠", metrics=metrics)
 
+        final_val = self._validate_slab(st, metrics, stage="geom_final", final=True)
+        if not final_val.ok:
+            return FilterResult(False, struct=st, reason=f"2D 几何无效: {final_val.reason}", metrics=metrics)
+
         return FilterResult(True, struct=st, metrics=metrics)
+
+    def _validate_slab(self, struct: Structure, metrics: Dict[str, object], stage: str, final: bool = False):
+        if not self.projector:
+            result = SlabValidationResult(True, metrics={})
+            record_slab_validation(metrics, stage, result, final=final)
+            return result
+        result = is_2d_structure(
+            struct,
+            layer_axis=self._layer_axis,
+            max_layer_thickness=self.args.layer_thickness_max,
+            min_vacuum_thickness=self._min_vacuum,
+            slab_center_tol=self._slab_center_tol,
+        )
+        record_slab_validation(metrics, stage, result, final=final)
+        return result
 
 
 class CandidateEvaluator:
