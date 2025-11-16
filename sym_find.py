@@ -55,6 +55,7 @@ import numpy as np
 from pymatgen.core import Structure, Lattice
 from pymatgen.core.periodic_table import Element
 from pymatgen.analysis.structure_matcher import StructureMatcher
+from pymatgen.analysis.local_env import CrystalNN, LocalStructOrderParams
 from pymatgen.io.cif import CifWriter
 from pymatgen.io.vasp import Poscar
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
@@ -179,6 +180,189 @@ class EvaluatorResult:
     primitive: Optional[Structure] = None
     meta: Optional[dict] = None
     reason: Optional[str] = None
+
+
+@dataclass
+class LocalEnvRule:
+    species: Optional[Tuple[str, ...]]
+    cn_range: Tuple[float, float]
+    threshold: float
+    preferred_motifs: Tuple[str, ...]
+    label: str = "default"
+    species_lower: Tuple[str, ...] = field(init=False, repr=False)
+
+    def __post_init__(self):
+        if self.species:
+            self.species_lower = tuple(s.lower() for s in self.species)
+        else:
+            self.species_lower = tuple()
+
+    def matches(self, specie: str) -> bool:
+        if not self.species_lower:
+            return False
+        return specie.lower() in self.species_lower
+
+    def describe(self) -> Dict[str, object]:
+        return {
+            "label": self.label,
+            "species": self.species,
+            "cn_range": self.cn_range,
+            "threshold": self.threshold,
+            "preferred_motifs": self.preferred_motifs,
+        }
+
+
+@dataclass
+class LocalEnvReport:
+    ok: bool
+    reason: Optional[str]
+    summary: Dict[str, object]
+
+    def to_metrics(self) -> Dict[str, object]:
+        return dict(self.summary)
+
+
+class LocalEnvConstraintChecker:
+    def __init__(self, config: Optional[Dict[str, object]], fallback_cn_range: Tuple[int, int]):
+        fallback = (float(fallback_cn_range[0]), float(fallback_cn_range[1]))
+        cfg_defaults = (config or {}).get("defaults") or {}
+        default_rule = LocalEnvRule(
+            species=None,
+            cn_range=tuple(cfg_defaults.get("cn_range", fallback)),
+            threshold=float(cfg_defaults.get("threshold", 0.0)),
+            preferred_motifs=tuple(cfg_defaults.get("preferred_motifs", ())),
+            label=str(cfg_defaults.get("label", "default")),
+        )
+        self.default_rule = default_rule
+
+        rules_cfg = (config or {}).get("rules") or []
+        self.rules: List[LocalEnvRule] = []
+        for entry in rules_cfg:
+            rule = LocalEnvRule(
+                species=tuple(entry.get("species")) if entry.get("species") else None,
+                cn_range=tuple(entry.get("cn_range", fallback)),
+                threshold=float(entry.get("threshold", default_rule.threshold)),
+                preferred_motifs=tuple(entry.get("preferred_motifs", default_rule.preferred_motifs)),
+                label=str(entry.get("label", "rule")),
+            )
+            self.rules.append(rule)
+
+        motif_types = sorted({m for rule in [self.default_rule] + self.rules for m in rule.preferred_motifs})
+        self._motif_types = tuple(motif_types)
+        self._cnn = CrystalNN()
+        self._lsop = LocalStructOrderParams(list(self._motif_types)) if self._motif_types else None
+        self._rule_summary = [rule.describe() for rule in ([self.default_rule] + self.rules)]
+
+    def analyze(self, struct: Structure) -> LocalEnvReport:
+        species_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"count": 0, "cn_fail": 0, "motif_fail": 0})
+        cn_fail = 0
+        motif_fail = 0
+        failures: List[Dict[str, object]] = []
+
+        for idx, site in enumerate(struct.sites):
+            specie = site.species_string
+            rule = self._rule_for(specie)
+            cn_val, cn_ok = self._compute_cn(struct, idx, rule)
+            motif_meta = self._compute_motif(struct, idx, rule)
+
+            species_stats[specie]["count"] += 1
+            if not cn_ok:
+                species_stats[specie]["cn_fail"] += 1
+                cn_fail += 1
+            if motif_meta and not motif_meta["ok"]:
+                species_stats[specie]["motif_fail"] += 1
+                motif_fail += 1
+
+            if (not cn_ok) or (motif_meta and not motif_meta["ok"]):
+                fail_entry = {
+                    "index": idx,
+                    "species": specie,
+                    "cn": None if cn_val is None else round(cn_val, 4),
+                    "cn_range": rule.cn_range,
+                    "cn_ok": cn_ok,
+                    "rule": rule.label,
+                }
+                if motif_meta:
+                    fail_entry.update({
+                        "best_motif": motif_meta.get("best_motif"),
+                        "best_score": motif_meta.get("best_score"),
+                        "threshold": motif_meta.get("threshold"),
+                        "motif_ok": motif_meta.get("ok"),
+                    })
+                failures.append(fail_entry)
+
+        ok = (cn_fail == 0) and (motif_fail == 0)
+        reason = None
+        if failures:
+            first = failures[0]
+            if not first.get("cn_ok", True):
+                reason = (
+                    f"{first['species']} 位点 #{first['index']} 的 CN={first['cn']} 超出 [{first['cn_range'][0]}, {first['cn_range'][1]}]"
+                )
+            elif not first.get("motif_ok", True):
+                reason = (
+                    f"{first['species']} 位点 #{first['index']} motif 匹配失败："
+                    f"{first.get('best_motif')} 得分={first.get('best_score')} < 阈值 {first.get('threshold')}"
+                )
+
+        species_summary = {k: dict(v) for k, v in species_stats.items()}
+        summary: Dict[str, object] = {
+            "ok": ok,
+            "total_sites": len(struct.sites),
+            "cn_failures": cn_fail,
+            "motif_failures": motif_fail,
+            "species_stats": species_summary,
+            "rules": self._rule_summary,
+        }
+        if failures:
+            summary["fail_sites"] = failures[:8]
+
+        return LocalEnvReport(ok=ok, reason=reason, summary=summary)
+
+    def _rule_for(self, specie: str) -> LocalEnvRule:
+        for rule in self.rules:
+            if rule.matches(specie):
+                return rule
+        return self.default_rule
+
+    def _compute_cn(self, struct: Structure, index: int, rule: LocalEnvRule):
+        try:
+            cn_val = float(self._cnn.get_cn(struct, index))
+        except Exception:
+            cn_val = None
+        if cn_val is None:
+            return None, False
+        lo, hi = rule.cn_range
+        return cn_val, bool(lo - 1e-6 <= cn_val <= hi + 1e-6)
+
+    def _compute_motif(self, struct: Structure, index: int, rule: LocalEnvRule) -> Optional[Dict[str, object]]:
+        if not self._lsop or not rule.preferred_motifs:
+            return None
+        try:
+            values = self._lsop.get_order_parameters(struct, index)
+        except Exception:
+            values = None
+        if values is None:
+            return {"ok": False, "best_motif": None, "best_score": None, "threshold": rule.threshold}
+        motif_map = {motif: float(values[i]) for i, motif in enumerate(self._motif_types)}
+        best_motif = None
+        best_score = None
+        for motif in rule.preferred_motifs:
+            if motif not in motif_map:
+                continue
+            score = motif_map[motif]
+            if best_score is None or score > best_score:
+                best_score = score
+                best_motif = motif
+        ok = True
+        if rule.preferred_motifs:
+            ok = bool(best_score is not None and best_score >= rule.threshold)
+        return {
+            "ok": ok,
+            "best_motif": best_motif,
+            "best_score": None if best_score is None else round(best_score, 4),
+            "threshold": rule.threshold,
+        }
 
 
 class GeometryConstraints:
@@ -398,6 +582,125 @@ def parse_sg_list(value):
     return sorted(set(out))
 
 
+def _parse_cn_range(value, fallback: Tuple[float, float]) -> Tuple[float, float]:
+    if value is None:
+        return tuple(float(x) for x in fallback)
+    if isinstance(value, str):
+        tokens = [tok.strip() for tok in value.split(",") if tok.strip()]
+    elif isinstance(value, (list, tuple)):
+        tokens = list(value)
+    else:
+        raise TypeError(f"cn_range 需为字符串或列表，收到 {value!r}")
+    if len(tokens) != 2:
+        raise ValueError(f"cn_range 需包含两个数值，收到 {tokens!r}")
+    lo, hi = float(tokens[0]), float(tokens[1])
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _parse_motif_list(raw, fallback: Sequence[str] = ()) -> Tuple[str, ...]:
+    if raw is None:
+        return tuple(str(m) for m in fallback)
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        raise TypeError(f"preferred_motifs 需为字符串或数组，收到 {raw!r}")
+    motifs: List[str] = []
+    for item in items:
+        txt = str(item).strip()
+        if txt:
+            motifs.append(txt)
+    return tuple(motifs)
+
+
+def _ensure_species_list(value, fallback: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
+    if value is None:
+        if fallback is None:
+            raise ValueError("local_env_constraints: 缺少 species 指定")
+        value = fallback
+    if isinstance(value, str):
+        species = [value]
+    elif isinstance(value, (list, tuple, set)):
+        species = list(value)
+    else:
+        raise TypeError(f"species 需为字符串或字符串列表，收到 {value!r}")
+    normalized = []
+    for sp in species:
+        txt = str(sp).strip()
+        if txt:
+            normalized.append(txt)
+    if not normalized:
+        raise ValueError("species 列表不能为空")
+    return tuple(normalized)
+
+
+def normalize_local_env_constraints(params: Dict[str, object], cn_range_fallback: Tuple[int, int]):
+    raw = params.get("local_env_constraints")
+    if not raw:
+        return None
+    if not isinstance(raw, dict):
+        raise TypeError("local_env_constraints 需为对象")
+
+    default_cn_range = _parse_cn_range(raw.get("defaults", {}).get("cn_range"), tuple(float(x) for x in cn_range_fallback))
+    default_threshold = float(raw.get("defaults", {}).get("threshold", 0.7))
+    default_motifs = _parse_motif_list(raw.get("defaults", {}).get("preferred_motifs", ()))
+
+    normalized = {
+        "defaults": {
+            "cn_range": default_cn_range,
+            "threshold": default_threshold,
+            "preferred_motifs": default_motifs,
+            "label": raw.get("defaults", {}).get("label", "default"),
+        },
+        "rules": [],
+    }
+
+    entries = raw.get("elements")
+    if entries is None:
+        for key in ("rules", "per_species"):
+            if key in raw:
+                entries = raw[key]
+                break
+    if entries is None:
+        inferred = {k: v for k, v in raw.items() if k not in {"defaults", "elements", "rules", "per_species"}}
+        if inferred:
+            entries = inferred
+
+    if entries is None:
+        return normalized
+
+    def _iter_entries(obj):
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                yield key, val
+        elif isinstance(obj, list):
+            for val in obj:
+                yield None, val
+        else:
+            raise TypeError("local_env_constraints.elements 需为对象或数组")
+
+    for key, entry in _iter_entries(entries):
+        if not isinstance(entry, dict):
+            raise TypeError("local_env_constraints 元素需为对象")
+        species = _ensure_species_list(entry.get("species"), fallback=[key] if key else None)
+        cn_range = _parse_cn_range(entry.get("cn_range"), default_cn_range)
+        threshold = float(entry.get("threshold", default_threshold))
+        motifs = _parse_motif_list(entry.get("preferred_motifs"), default_motifs)
+        label = entry.get("label") or "/".join(species)
+        normalized["rules"].append({
+            "species": species,
+            "cn_range": cn_range,
+            "threshold": threshold,
+            "preferred_motifs": motifs,
+            "label": label,
+        })
+
+    return normalized
+
+
 def load_settings(config_path: str) -> argparse.Namespace:
     """
     只读 settings 部分，结构一律从 structure_file（默认 POSCAR）读取。
@@ -469,6 +772,8 @@ def load_settings(config_path: str) -> argparse.Namespace:
         # 用于最近邻统计和 CN 的元素对（可以改成任意中心/邻居元素）
         "center_species": "Ga",
         "neighbor_species": "As",
+
+        "local_env_constraints": None,
 
         # 结构文件路径，默认当前目录 POSCAR
         "structure_file": "POSCAR",
@@ -581,6 +886,8 @@ def load_settings(config_path: str) -> argparse.Namespace:
     params["target_sgs"] = parse_sg_list(params.get("target_sgs"))
     excl = parse_sg_list(params.get("exclude_sgs"))
     params["exclude_sgs"] = excl if excl is not None else []
+
+    params["local_env_constraints"] = normalize_local_env_constraints(params, tuple(params["cn_range"]))
 
     return argparse.Namespace(**params)
 
@@ -1197,10 +1504,15 @@ class SlabProjector:
 
 
 class CandidatePreprocessor:
-    def __init__(self, args, projector: SlabProjector, constraints: GeometryConstraints):
+    def __init__(self,
+                 args,
+                 projector: SlabProjector,
+                 constraints: GeometryConstraints,
+                 local_env_checker: Optional[LocalEnvConstraintChecker] = None):
         self.args = args
         self.projector = projector
         self.constraints = constraints
+        self.local_env_checker = local_env_checker
 
     def preprocess(self, struct: Structure) -> PreprocessResult:
         st, slab_metrics = self.projector.project(struct, with_metrics=True)
@@ -1248,6 +1560,11 @@ class CandidatePreprocessor:
                     reason=self._pair_violation_reason(report.violations[0]),
                     metrics=metrics,
                 )
+            env_check = self._local_env_metrics(st)
+            if env_check:
+                metrics["local_env_pre"] = env_check.to_metrics()
+                if not env_check.ok:
+                    return PreprocessResult(False, struct=st, reason=f"local_env: {env_check.reason}", metrics=metrics)
             return PreprocessResult(True, struct=st, scale_ab=1.0, metrics=metrics)
 
         ok, scaled, scale, extra_metrics, reason = self._apply_scaling(st, cand_d)
@@ -1255,7 +1572,17 @@ class CandidatePreprocessor:
             return PreprocessResult(False, struct=st, reason=reason, metrics=metrics)
 
         metrics.update(extra_metrics)
+        env_check = self._local_env_metrics(scaled)
+        if env_check:
+            metrics["local_env_pre"] = env_check.to_metrics()
+            if not env_check.ok:
+                return PreprocessResult(False, struct=scaled, reason=f"local_env: {env_check.reason}", metrics=metrics)
         return PreprocessResult(True, struct=scaled, scale_ab=scale, metrics=metrics)
+
+    def _local_env_metrics(self, struct: Structure) -> Optional[LocalEnvReport]:
+        if not self.local_env_checker:
+            return None
+        return self.local_env_checker.analyze(struct)
 
     def _apply_scaling(self, struct: Structure, cand_d: np.ndarray):
         bond_min = self.args.bond_target_min
@@ -1479,13 +1806,13 @@ class CandidateEvaluator:
                  args,
                  ref_stats: dict,
                  symprecs: Sequence[float],
-                 cn_range: Tuple[int, int],
+                 local_env_checker: Optional[LocalEnvConstraintChecker] = None,
                  projector: Optional[SlabProjector] = None):
         self.args = args
         self.ref_stats = ref_stats
         self.symprecs = tuple(symprecs)
-        self.cn_lo, self.cn_hi = cn_range
         self.projector = projector
+        self.local_env_checker = local_env_checker
 
     def evaluate(self,
                  struct: Structure,
@@ -1504,11 +1831,12 @@ class CandidateEvaluator:
             neighbor_species=self.args.neighbor_species,
         )
 
-        CNs = cost_stats.get("CNs", [])
-        if not CNs:
-            return EvaluatorResult(False, reason="CN 统计为空")
-        if not all(self.cn_lo <= cn <= self.cn_hi for cn in CNs):
-            return EvaluatorResult(False, reason=f"CN={CNs} 超出 [{self.cn_lo}, {self.cn_hi}]")
+        env_summary = None
+        if self.local_env_checker:
+            env_report = self.local_env_checker.analyze(struct)
+            env_summary = env_report.to_metrics()
+            if not env_report.ok:
+                return EvaluatorResult(False, reason=f"local_env: {env_report.reason}")
 
         ok_sg, sg_found, sym_used = verify_spacegroup_exact(
             struct,
@@ -1540,6 +1868,8 @@ class CandidateEvaluator:
             meta.update(slab_metrics)
         if "z_thickness" in meta and "z_ptp" not in meta:
             meta["z_ptp"] = meta["z_thickness"]
+        if env_summary:
+            meta["local_env_final"] = env_summary
 
         return EvaluatorResult(True, primitive=prim, meta=meta)
 
@@ -1668,8 +1998,6 @@ def main():
     if not target_sgs:
         raise ValueError("目标空间群列表为空，请检查 target_sgs/exclude_sgs 设置。")
 
-    cn_lo, cn_hi = int(args.cn_range[0]), int(args.cn_range[1])
-
     # 基本信息：基胞里的元素计数（只算一次就行）
     idx_map_base = get_species_indices(base)
     center_key = args.center_species.lower()
@@ -1701,9 +2029,10 @@ def main():
 
     constraints = GeometryConstraints(args)
     generator = CandidateGenerator(args)
-    preprocessor = CandidatePreprocessor(args, slab_projector, constraints)
+    local_env_checker = LocalEnvConstraintChecker(args.local_env_constraints, tuple(args.cn_range))
+    preprocessor = CandidatePreprocessor(args, slab_projector, constraints, local_env_checker)
     geom_filter = GeometryFilter(args, constraints, symprecs, slab_projector)
-    evaluator = CandidateEvaluator(args, ref_stats, symprecs, (cn_lo, cn_hi), projector=slab_projector)
+    evaluator = CandidateEvaluator(args, ref_stats, symprecs, local_env_checker, projector=slab_projector)
 
     for idx, sg in enumerate(target_sgs, 1):
         sg_dir = makedirs(os.path.join(outdir, f"SG_{sg:03d}"))
