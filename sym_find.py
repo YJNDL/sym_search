@@ -47,10 +47,13 @@ import argparse
 import random
 import traceback
 from collections import defaultdict, Counter
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from pymatgen.core import Structure, Lattice
+from pymatgen.core.periodic_table import Element
 from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.io.cif import CifWriter
 from pymatgen.io.vasp import Poscar
@@ -92,7 +95,308 @@ def append_log(path: str, line: str):
         f.write(line.rstrip() + "\n")
 
 
+def as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def axis_to_index(value) -> int:
+    mapping = {
+        "a": 0, "x": 0, "0": 0, 0: 0,
+        "b": 1, "y": 1, "1": 1, 1: 1,
+        "c": 2, "z": 2, "2": 2, 2: 2,
+    }
+    if isinstance(value, str):
+        key = value.strip().lower()
+    else:
+        key = value
+    if key in mapping:
+        return mapping[key]
+    raise ValueError(f"layer_axis 不支持 {value!r}，请使用 a/b/c 或 x/y/z")
+
+
+def axis_index_to_label(axis: int) -> str:
+    return {0: "a", 1: "b", 2: "c"}.get(axis, "c")
+
+
+def parse_pair_distance_matrix(raw) -> Dict[Tuple[str, str], float]:
+    matrix: Dict[Tuple[str, str], float] = {}
+    if not raw:
+        return matrix
+
+    def _store(a: str, b: str, dist):
+        if dist is None:
+            return
+        key = tuple(sorted((a.lower(), b.lower())))
+        matrix[key] = float(dist)
+
+    if isinstance(raw, dict):
+        for key, val in raw.items():
+            if isinstance(val, dict):
+                a = key
+                for b, dist in val.items():
+                    _store(a, b, dist)
+            else:
+                if "-" not in key:
+                    raise ValueError(f"min_pair_dist_matrix 的键需形如 A-B，收到 {key!r}")
+                a, b = key.split("-", 1)
+                _store(a, b, val)
+    else:
+        raise TypeError("min_pair_dist_matrix 需为字典或嵌套字典")
+    return matrix
+
+
+@dataclass
+class PairDistanceReport:
+    min_distance: float
+    min_pair: Tuple[str, str]
+    violations: List[Dict[str, object]] = field(default_factory=list)
+
+
+@dataclass
+class PreprocessResult:
+    ok: bool
+    struct: Optional[Structure] = None
+    scale_ab: float = 1.0
+    reason: Optional[str] = None
+    metrics: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class FilterResult:
+    ok: bool
+    struct: Optional[Structure] = None
+    metrics: Dict[str, object] = field(default_factory=dict)
+    reason: Optional[str] = None
+
+
+@dataclass
+class EvaluatorResult:
+    ok: bool
+    primitive: Optional[Structure] = None
+    meta: Optional[dict] = None
+    reason: Optional[str] = None
+
+
+class GeometryConstraints:
+    """Utility helpers for pair-distance and hard-sphere checks."""
+
+    def __init__(self, args):
+        self.min_pair_dist = float(args.min_pair_dist)
+        self.min_pair_matrix = dict(getattr(args, "min_pair_dist_matrix", {}))
+        self.min_bond_length_factor = float(getattr(args, "min_bond_length_factor", 0.9))
+        self.hard_sphere_radius_scale = float(getattr(args, "hard_sphere_radius_scale", 0.95))
+        self.reject_if_overlap = as_bool(getattr(args, "reject_if_overlap", True))
+        self._radius_cache: Dict[str, float] = {}
+
+    def _element_radius(self, symbol: str) -> Optional[float]:
+        key = symbol.lower()
+        if key in self._radius_cache:
+            return self._radius_cache[key]
+        try:
+            elem = Element(symbol)
+            rad = elem.covalent_radius or elem.atomic_radius
+        except Exception:
+            rad = None
+        if rad is not None:
+            rad = float(rad)
+        self._radius_cache[key] = rad if rad is None else float(rad)
+        return self._radius_cache[key]
+
+    def pair_threshold(self, elem_a: str, elem_b: str) -> float:
+        key = tuple(sorted((elem_a.lower(), elem_b.lower())))
+        if key in self.min_pair_matrix:
+            return float(self.min_pair_matrix[key])
+        ra = self._element_radius(elem_a)
+        rb = self._element_radius(elem_b)
+        fallback = self.min_pair_dist
+        if ra is not None and rb is not None:
+            fallback = max(fallback, self.min_bond_length_factor * (ra + rb))
+        return fallback
+
+    def hard_sphere_radius(self, elem: str) -> float:
+        rad = self._element_radius(elem)
+        if rad is None:
+            rad = 0.5 * self.min_pair_dist
+        return self.hard_sphere_radius_scale * float(rad)
+
+    def analyze_pairs(self, struct: Structure) -> PairDistanceReport:
+        L = struct.lattice
+        frac = np.array([s.frac_coords for s in struct.sites])
+        species = [s.species_string for s in struct.sites]
+        n = len(species)
+        dmin = 1e9
+        pair = ("", "")
+        violations: List[Dict[str, object]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                df = min_image_vec(frac[j] - frac[i])
+                d = np.linalg.norm(df @ L.matrix)
+                if d < dmin:
+                    dmin = d
+                    pair = (species[i], species[j])
+                thresh = self.pair_threshold(species[i], species[j])
+                if d < thresh:
+                    violations.append({
+                        "i": i,
+                        "j": j,
+                        "species_i": species[i],
+                        "species_j": species[j],
+                        "distance": d,
+                        "threshold": thresh,
+                    })
+        return PairDistanceReport(min_distance=float(dmin) if n else 0.0,
+                                  min_pair=pair,
+                                  violations=violations)
+
+
+def hard_sphere_relax(struct: Structure,
+                      constraints: GeometryConstraints,
+                      max_iter: int = 30,
+                      step: float = 0.4):
+    """Simple hard-sphere relaxation that pushes overlapping atoms apart."""
+
+    st = struct.copy()
+    lattice = st.lattice
+    frac = np.array([s.frac_coords for s in st.sites], dtype=float)
+    species = [s.species_string for s in st.sites]
+
+    iterations = 0
+    for it in range(max_iter):
+        moved = False
+        for i in range(len(species)):
+            for j in range(i + 1, len(species)):
+                df = min_image_vec(frac[j] - frac[i])
+                vec = df @ lattice.matrix
+                dist = np.linalg.norm(vec)
+                thresh = constraints.pair_threshold(species[i], species[j])
+                if dist >= thresh or dist <= 1e-6:
+                    continue
+                direction = vec / (dist + 1e-8)
+                delta = 0.5 * (thresh - dist) * min(1.0, step)
+                move_cart = direction * delta
+                move_frac = lattice.get_fractional_coords(move_cart)
+                frac[i] = (frac[i] - move_frac) % 1.0
+                frac[j] = (frac[j] + move_frac) % 1.0
+                moved = True
+        iterations = it + 1
+        if not moved:
+            break
+
+    relaxed = Structure(lattice,
+                        [s.species for s in st.sites],
+                        frac,
+                        coords_are_cartesian=False)
+    return relaxed, iterations
+
+
+def motif_overlap_report(struct: Structure,
+                         constraints: GeometryConstraints,
+                         symprec=1e-3,
+                         angle_tolerance=0.5,
+                         pad: float = 0.2):
+    try:
+        sga = SpacegroupAnalyzer(struct, symprec=symprec, angle_tolerance=angle_tolerance)
+        dataset = sga.get_symmetry_dataset()
+    except Exception:
+        return False, {}
+
+    equiv = dataset.get("equivalent_atoms")
+    if equiv is None:
+        return False, {}
+
+    groups = defaultdict(list)
+    for idx, label in enumerate(equiv):
+        groups[label].append(idx)
+
+    lattice = struct.lattice
+    centers = []
+    for label, indices in groups.items():
+        coords = np.array([struct[i].frac_coords for i in indices])
+        cart = coords @ lattice.matrix
+        center_cart = np.mean(cart, axis=0)
+        center_frac = lattice.get_fractional_coords(center_cart)
+        radii = [constraints.hard_sphere_radius(struct[i].species_string) for i in indices]
+        local = np.max([np.linalg.norm(cart[k] - center_cart) + radii[k] for k in range(len(indices))])
+        centers.append({
+            "label": label,
+            "center_frac": center_frac,
+            "radius": float(local + pad),
+        })
+
+    overlaps = []
+    for i in range(len(centers)):
+        for j in range(i + 1, len(centers)):
+            df = min_image_vec(centers[j]["center_frac"] - centers[i]["center_frac"])
+            dist = np.linalg.norm(df @ lattice.matrix)
+            limit = centers[i]["radius"] + centers[j]["radius"]
+            if dist < limit:
+                overlaps.append({
+                    "motif_i": centers[i]["label"],
+                    "motif_j": centers[j]["label"],
+                    "distance": dist,
+                    "limit": limit,
+                })
+
+    return bool(overlaps), {"overlaps": overlaps, "motif_count": len(centers)}
+
+
 # ------------------------------ 从 config.json 读取 settings ------------------------------
+
+def parse_sg_list(value):
+    """Parse a user-provided space-group spec into a sorted list of ints.
+
+    The spec can be:
+    - ``None`` → returns ``None`` (caller decides the default behaviour).
+    - an int → ``[int]``.
+    - a list/tuple of ints or strings.
+    - a string with comma/semicolon separated tokens. Each token can either be
+      a single integer (``"33"``) or an inclusive range (``"20-45"``).
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, int):
+        tokens = [value]
+    elif isinstance(value, (list, tuple)):
+        tokens = list(value)
+    elif isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return []
+        tokens = [tok.strip() for tok in txt.replace(";", ",").split(",") if tok.strip()]
+    else:
+        raise TypeError(f"无法解析的空间群列表: {value!r}")
+
+    out = []
+    for tok in tokens:
+        if isinstance(tok, int):
+            nums = [tok]
+        else:
+            tok_str = str(tok).strip()
+            if not tok_str:
+                continue
+            if "-" in tok_str:
+                start_str, end_str = tok_str.split("-", 1)
+                if not start_str.strip() or not end_str.strip():
+                    raise ValueError(f"非法的空间群区间: {tok_str}")
+                start, end = int(start_str), int(end_str)
+                if start > end:
+                    start, end = end, start
+                nums = list(range(start, end + 1))
+            else:
+                nums = [int(tok_str)]
+        for num in nums:
+            if num < 1 or num > 230:
+                raise ValueError(f"空间群编号应在 1..230 之间，收到 {num}")
+            out.append(int(num))
+
+    return sorted(set(out))
+
 
 def load_settings(config_path: str) -> argparse.Namespace:
     """
@@ -124,7 +428,8 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "outdir": "out",
 
         "bond_tol": 0.4,
-        "vacuum_c": 20.0,
+        "vacuum_thickness": 20.0,
+        "vacuum_buffer": 1.0,
 
         "det_max": 12,
         "max_atoms": 96,
@@ -136,6 +441,13 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "cn_target": 4,
         "cn_range": [3, 6],
         "min_pair_dist": 1.8,
+        "min_pair_dist_matrix": {},
+        "min_bond_length_factor": 0.9,
+        "hard_sphere_radius_scale": 0.95,
+        "reject_if_overlap": True,
+        "motif_overlap_tol": 0.25,
+        "density_range": None,
+        "post_gen_relax": {"mode": "none", "max_iter": 30, "step": 0.4},
 
         # 表面起伏上限（Å），控制顶 / 底表面原子的 z 起伏；不再直接表示整体厚度
         "z_flat_tol": 0.3,
@@ -148,7 +460,11 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "seed": 2025,
 
         # 目标原子层最大整体厚度（Å），>0 时会主动压扁 z 分布
+        "layer_thickness": None,
         "layer_thickness_max": 3.0,
+        "layer_axis": "c",
+        "slab_center": 0.5,
+        "reslab_after_relax": True,
 
         # 用于最近邻统计和 CN 的元素对（可以改成任意中心/邻居元素）
         "center_species": "Ga",
@@ -179,6 +495,10 @@ def load_settings(config_path: str) -> argparse.Namespace:
 
         # 用于 surface corrugation 的“表面厚度占比”（顶/底各取多少厚度参与起伏统计）
         "surface_frac": 0.25,
+
+        # target SG selection（None 表示自动）
+        "target_sgs": None,
+        "exclude_sgs": [],
     }
 
     # 合并默认和用户设置
@@ -199,41 +519,162 @@ def load_settings(config_path: str) -> argparse.Namespace:
         params["cn_range"] = [int(params["cn_range"][0]), int(params["cn_range"][1])]
 
     # enable_sqrt3 / enable_bond_scaling: 布尔
-    for key in ("enable_sqrt3", "enable_bond_scaling"):
-        if isinstance(params[key], str):
-            params[key] = params[key].strip().lower() in ("1", "true", "yes", "y")
+    for key in ("enable_sqrt3", "enable_bond_scaling", "reject_if_overlap",
+                "debug_save_all_cands", "debug_save_rejected"):
+        params[key] = as_bool(params.get(key))
 
     # 数值
     params["bond_target_min"] = float(params["bond_target_min"])
     params["bond_target_max"] = float(params["bond_target_max"])
     params["min_pair_dist"] = float(params["min_pair_dist"])
-    params["vacuum_c"] = float(params["vacuum_c"])
+    params["min_bond_length_factor"] = float(params.get("min_bond_length_factor", 0.9))
+    params["hard_sphere_radius_scale"] = float(params.get("hard_sphere_radius_scale", 0.95))
+    params["motif_overlap_tol"] = float(params.get("motif_overlap_tol", 0.25))
+    if "vacuum_thickness" not in params and "vacuum_c" in params:
+        params["vacuum_thickness"] = params["vacuum_c"]
+    params["vacuum_thickness"] = float(params.get("vacuum_thickness", 20.0))
+    if params["vacuum_thickness"] <= 0:
+        raise ValueError("vacuum_thickness 必须为正数，才能形成二维层状结构")
+    params["vacuum_buffer"] = float(params.get("vacuum_buffer", 1.0))
     params["z_flat_tol"] = float(params["z_flat_tol"])
+    layer_thickness = params.get("layer_thickness")
+    if layer_thickness is None:
+        params["layer_thickness"] = None
+    else:
+        layer_val = float(layer_thickness)
+        params["layer_thickness"] = layer_val if layer_val > 0 else None
+
     params["layer_thickness_max"] = float(params["layer_thickness_max"])
+    params["slab_center"] = float(params.get("slab_center", 0.5))
     params["w_cost_d"] = float(params["w_cost_d"])
     params["w_cost_cn"] = float(params["w_cost_cn"])
     params["surface_frac"] = float(params["surface_frac"])
+    params["layer_axis"] = str(params.get("layer_axis", "c"))
+    params["layer_axis_index"] = axis_to_index(params["layer_axis"])
+    params["reslab_after_relax"] = as_bool(params.get("reslab_after_relax", True))
 
     params["bond_scaling_mode"] = str(params.get("bond_scaling_mode", "soft")).lower()
     params["bond_coverage_min"] = float(params.get("bond_coverage_min", 0.8))
+
+    params["min_pair_dist_matrix"] = parse_pair_distance_matrix(params.get("min_pair_dist_matrix"))
+
+    density_range = params.get("density_range")
+    if density_range is None:
+        params["density_range"] = None
+    else:
+        if isinstance(density_range, str):
+            density_range = [float(x) for x in density_range.split(",") if x.strip()]
+        if len(density_range) != 2:
+            raise ValueError("density_range 需包含两个数值 [min, max]")
+        params["density_range"] = (float(density_range[0]), float(density_range[1]))
+
+    post_relax = params.get("post_gen_relax") or {}
+    if not isinstance(post_relax, dict):
+        raise TypeError("post_gen_relax 需为对象，例如 {\"mode\": \"none\"}")
+    base_relax = defaults["post_gen_relax"]
+    merged_relax = {**base_relax, **post_relax}
+    merged_relax["mode"] = str(merged_relax.get("mode", "none")).lower()
+    merged_relax["max_iter"] = int(merged_relax.get("max_iter", base_relax["max_iter"]))
+    merged_relax["step"] = float(merged_relax.get("step", base_relax["step"]))
+    params["post_gen_relax"] = merged_relax
+
+    params["target_sgs"] = parse_sg_list(params.get("target_sgs"))
+    excl = parse_sg_list(params.get("exclude_sgs"))
+    params["exclude_sgs"] = excl if excl is not None else []
 
     return argparse.Namespace(**params)
 
 
 # ------------------------------ 几何与邻接（通用元素版） ------------------------------
 
-def ensure_vacuum_c(struct: Structure, c_target_low=18.0, c_target_high=25.0) -> Structure:
-    """
-    只调整 c 长度至给定范围，不改变 a,b 与角度，保持 z 分数坐标不变。
-    """
-    L = struct.lattice
-    c = L.c
-    if c_target_low <= c <= c_target_high:
+def ensure_vacuum_axis(struct: Structure,
+                       axis_index: int = 2,
+                       target: float = 20.0,
+                       buffer: float = 1.0) -> Structure:
+    """Adjust the lattice vector *axis_index* so it provides the desired vacuum."""
+
+    if target <= 0:
         return struct.copy()
-    c_new = max(min(c, c_target_high), c_target_low)
-    L_new = Lattice.from_parameters(L.a, L.b, c_new, L.alpha, L.beta, L.gamma)
-    return Structure(L_new, [s.species for s in struct.sites],
-                     [s.frac_coords for s in struct.sites], coords_are_cartesian=False)
+
+    lattice = struct.lattice
+    matrix = lattice.matrix.copy()
+    axis_vec = matrix[axis_index]
+    current = np.linalg.norm(axis_vec)
+    lo = target - max(buffer, 0.0)
+    hi = target + max(buffer, 0.0)
+    if lo <= current <= hi and current > 0:
+        return struct.copy()
+
+    if current <= 0:
+        direction = np.zeros(3)
+        direction[axis_index] = 1.0
+    else:
+        direction = axis_vec / current
+    matrix[axis_index] = direction * target
+    new_lattice = Lattice(matrix)
+    return Structure(new_lattice,
+                     [s.species for s in struct.sites],
+                     [s.frac_coords for s in struct.sites],
+                     coords_are_cartesian=False)
+
+
+def ensure_vacuum_c(struct: Structure, c_target_low=18.0, c_target_high=25.0) -> Structure:
+    target = 0.5 * (c_target_low + c_target_high)
+    buffer = max(target - c_target_low, c_target_high - target)
+    return ensure_vacuum_axis(struct, axis_index=2, target=target, buffer=buffer)
+
+
+def orthogonalize_lattice_to_axis(struct: Structure, axis_index: int = 2) -> Structure:
+    """Remove the component of in-plane lattice vectors along the slab normal."""
+
+    lattice = struct.lattice
+    mat = np.array(lattice.matrix, dtype=float)
+    axis_vec = mat[axis_index]
+    axis_norm = np.linalg.norm(axis_vec)
+    if axis_norm <= 1e-8:
+        axis_vec = np.zeros(3)
+        axis_vec[axis_index] = 1.0
+        axis_norm = 1.0
+    axis_unit = axis_vec / axis_norm
+
+    for idx in range(3):
+        if idx == axis_index:
+            continue
+        vec = mat[idx]
+        vec_proj = vec - np.dot(vec, axis_unit) * axis_unit
+        if np.linalg.norm(vec_proj) <= 1e-8:
+            basis = np.zeros(3)
+            basis[(idx + 1) % 3] = 1.0
+            vec_proj = basis - np.dot(basis, axis_unit) * axis_unit
+        mat[idx] = vec_proj
+
+    mat[axis_index] = axis_unit * axis_norm
+    new_lattice = Lattice(mat)
+    return Structure(new_lattice,
+                     [s.species for s in struct.sites],
+                     struct.cart_coords,
+                     coords_are_cartesian=True)
+
+
+def set_axis_length(struct: Structure, axis_index: int, target: float) -> Structure:
+    """Rescale a lattice vector while keeping fractional coordinates fixed."""
+
+    if target <= 0:
+        return struct
+
+    mat = np.array(struct.lattice.matrix, dtype=float)
+    axis_vec = mat[axis_index]
+    axis_norm = np.linalg.norm(axis_vec)
+    if axis_norm <= 1e-8:
+        axis_vec = np.zeros(3)
+        axis_vec[axis_index] = 1.0
+        axis_norm = 1.0
+    mat[axis_index] = axis_vec / axis_norm * target
+    new_lattice = Lattice(mat)
+    return Structure(new_lattice,
+                     [s.species for s in struct.sites],
+                     [s.frac_coords for s in struct.sites],
+                     coords_are_cartesian=False)
 
 
 def min_image_vec(frac_delta):
@@ -434,16 +875,17 @@ def min_any_pair_distance(struct: Structure) -> float:
     return float(dmin)
 
 
-def layer_thickness_angstrom(struct: Structure) -> float:
-    """
-    整体层厚度：z 方向上 max(z) - min(z)（Å）。
-    """
-    c = struct.lattice.c
-    zs = np.array([s.frac_coords[2] * c for s in struct.sites])
-    return float(np.ptp(zs))
+def layer_thickness_angstrom(struct: Structure, axis_index: int = 2) -> float:
+    """Return the slab thickness (Å) along the selected axis."""
+
+    axis_len = struct.lattice.lengths[axis_index]
+    coords = np.array([s.frac_coords[axis_index] * axis_len for s in struct.sites])
+    return float(np.ptp(coords))
 
 
-def surface_corrugation_angstrom(struct: Structure, surface_frac: float = 0.25):
+def surface_corrugation_angstrom(struct: Structure,
+                                 surface_frac: float = 0.25,
+                                 axis_index: int = 2):
     """
     估算“表面起伏”：
     - 先取所有原子的 z_cart，得到总厚度 thickness。
@@ -453,9 +895,8 @@ def surface_corrugation_angstrom(struct: Structure, surface_frac: float = 0.25):
 
     返回 (corrugation, thickness)，单位 Å。
     """
-    L = struct.lattice
-    c = L.c
-    z_cart = np.array([s.frac_coords[2] * c for s in struct.sites])
+    axis_len = struct.lattice.lengths[axis_index]
+    z_cart = np.array([s.frac_coords[axis_index] * axis_len for s in struct.sites])
     z_min = float(z_cart.min())
     z_max = float(z_cart.max())
     thickness = z_max - z_min
@@ -472,42 +913,53 @@ def surface_corrugation_angstrom(struct: Structure, surface_frac: float = 0.25):
     return max(corr_top, corr_bot), thickness
 
 
-def squash_layer_thickness(struct: Structure, max_thickness: float) -> Structure:
-    """
-    将结构中原子在 z 方向的整体厚度压缩到不超过 max_thickness（Å）。
-    只改变原子 z 分数坐标，不改变 a,b,c 和角度。
-    如果 max_thickness<=0 或者原本就比它薄，则直接返回原结构。
-    """
-    if max_thickness is None or max_thickness <= 0:
+def squash_layer_thickness(struct: Structure,
+                           max_thickness: float,
+                           axis_index: int = 2,
+                           target_center: Optional[float] = 0.5,
+                           target_thickness: Optional[float] = None) -> Structure:
+    """Compress atoms into a thin slab along the selected axis."""
+
+    axis_len = struct.lattice.lengths[axis_index]
+    if axis_len <= 0:
         return struct
 
-    L = struct.lattice
-    c = L.c
-    z_cart = np.array([s.frac_coords[2] * c for s in struct.sites])
-    z_min = float(z_cart.min())
-    z_max = float(z_cart.max())
+    coords = np.array([s.frac_coords for s in struct.sites], dtype=float)
+    axis_cart = coords[:, axis_index] * axis_len
+    if axis_cart.size == 0:
+        return struct
+
+    z_min = float(axis_cart.min())
+    z_max = float(axis_cart.max())
     thickness = z_max - z_min
+    if thickness < 1e-9:
+        thickness = 0.0
 
-    if thickness < 1e-6 or thickness <= max_thickness:
-        return struct
+    scale = 1.0
+    if target_thickness is not None and target_thickness > 0 and thickness > 0:
+        scale = target_thickness / thickness
+    elif max_thickness is not None and max_thickness > 0 and thickness > max_thickness:
+        scale = max_thickness / thickness
 
-    z_mid = 0.5 * (z_max + z_min)
-    scale = max_thickness / thickness
+    mid_current = 0.5 * (z_max + z_min)
+    if target_center is None:
+        target_mid = mid_current
+    else:
+        frac_center = float(target_center)
+        target_mid = frac_center * axis_len
 
     new_frac = []
-    for s in struct.sites:
-        fc = np.array(s.frac_coords, dtype=float)
-        zc = fc[2] * c
-        zc_new = (zc - z_mid) * scale + z_mid
-        fc[2] = zc_new / c
-        new_frac.append(fc)
+    for fc in coords:
+        axis_val = fc[axis_index] * axis_len
+        axis_new = (axis_val - mid_current) * scale + target_mid
+        fc_new = fc.copy()
+        fc_new[axis_index] = (axis_new / axis_len) % 1.0
+        new_frac.append(fc_new)
 
-    return Structure(
-        L,
-        [s.species for s in struct.sites],
-        new_frac,
-        coords_are_cartesian=False
-    )
+    return Structure(struct.lattice,
+                     [s.species for s in struct.sites],
+                     new_frac,
+                     coords_are_cartesian=False)
 
 
 def candidate_cost(struct: Structure,
@@ -665,6 +1117,433 @@ def pyxtal_generate_candidates(sg: int,
     return cand
 
 
+class CandidateGenerator:
+    def __init__(self, args):
+        self.args = args
+
+    def generate(self, sg: int, num_center: int, num_neighbor: int):
+        if not _HAS_PYXTAL:
+            return []
+        return pyxtal_generate_candidates(
+            sg,
+            num_center=num_center,
+            num_neighbor=num_neighbor,
+            center_species=self.args.center_species,
+            neighbor_species=self.args.neighbor_species,
+            trials=self.args.samples_per_sg,
+        )
+
+
+class SlabProjector:
+    """Utility object that enforces the 2D slab geometry."""
+
+    def __init__(self, args):
+        self.axis_index = int(getattr(args, "layer_axis_index", 2))
+        self.axis_label = axis_index_to_label(self.axis_index)
+        self.vacuum_target = float(getattr(args, "vacuum_thickness", 20.0))
+        self.vacuum_buffer = float(getattr(args, "vacuum_buffer", 1.0))
+        self.layer_thickness = getattr(args, "layer_thickness", None)
+        self.layer_thickness_max = float(getattr(args, "layer_thickness_max", 0.0))
+        self.surface_frac = float(getattr(args, "surface_frac", 0.25))
+        self.slab_center = float(getattr(args, "slab_center", 0.5))
+
+    def project(self, struct: Structure, with_metrics: bool = False):
+        st = orthogonalize_lattice_to_axis(struct, axis_index=self.axis_index)
+        raw_thickness = max(layer_thickness_angstrom(st, axis_index=self.axis_index), 1e-6)
+        target_layer = raw_thickness
+        if self.layer_thickness and self.layer_thickness > 0:
+            target_layer = self.layer_thickness
+        elif self.layer_thickness_max > 0 and raw_thickness > self.layer_thickness_max:
+            target_layer = self.layer_thickness_max
+        target_layer = max(target_layer, 1e-3)
+
+        st = squash_layer_thickness(
+            st,
+            max_thickness=target_layer,
+            axis_index=self.axis_index,
+            target_center=self.slab_center,
+            target_thickness=target_layer,
+        )
+        total_axis = target_layer + self.vacuum_target
+        buffer = max(self.vacuum_buffer, 0.0)
+        if buffer > 0:
+            total_axis += buffer
+        st = set_axis_length(st, self.axis_index, total_axis)
+        st = squash_layer_thickness(
+            st,
+            max_thickness=target_layer,
+            axis_index=self.axis_index,
+            target_center=self.slab_center,
+            target_thickness=target_layer,
+        )
+
+        metrics: Dict[str, object] = {}
+        corr, thickness = surface_corrugation_angstrom(
+            st,
+            surface_frac=self.surface_frac,
+            axis_index=self.axis_index,
+        )
+        metrics.update({
+            "z_surf_corr": corr,
+            "z_thickness": thickness,
+            "layer_axis": self.axis_label,
+            "layer_target": target_layer,
+            "vacuum_gap": self.vacuum_target,
+            "axis_length_total": total_axis,
+        })
+        if not with_metrics:
+            metrics = {}
+        return st, metrics
+
+
+class CandidatePreprocessor:
+    def __init__(self, args, projector: SlabProjector, constraints: GeometryConstraints):
+        self.args = args
+        self.projector = projector
+        self.constraints = constraints
+
+    def preprocess(self, struct: Structure) -> PreprocessResult:
+        st, slab_metrics = self.projector.project(struct, with_metrics=True)
+        metrics: Dict[str, object] = dict(slab_metrics)
+
+        if self.args.layer_thickness_max > 0 and metrics.get("z_thickness", 0.0) > self.args.layer_thickness_max + 1e-3:
+            return PreprocessResult(False, struct=st, reason=(
+                f"thickness={metrics['z_thickness']:.3f}Å > layer_thickness_max={self.args.layer_thickness_max:.3f}Å"
+            ), metrics=metrics)
+
+        if metrics.get("z_surf_corr", 0.0) > self.args.z_flat_tol:
+            return PreprocessResult(False, struct=st, reason=(
+                f"surface_corr={metrics['z_surf_corr']:.3f}Å > z_flat_tol={self.args.z_flat_tol:.3f}Å"
+            ), metrics=metrics)
+
+        try:
+            cand_d = compute_candidate_nn_distances(
+                st,
+                center_species=self.args.center_species,
+                neighbor_species=self.args.neighbor_species,
+                k_per_site=4,
+            )
+        except ValueError as exc:
+            return PreprocessResult(False, struct=st, reason=f"compute_candidate_nn_distances 失败: {exc}", metrics=metrics)
+
+        if cand_d.size == 0:
+            return PreprocessResult(False, struct=st, reason="无法获取中心-邻居最近邻列表", metrics=metrics)
+
+        metrics["bond_target_range"] = [self.args.bond_target_min, self.args.bond_target_max]
+
+        if not self.args.enable_bond_scaling:
+            cand_min = float(np.min(cand_d))
+            cand_max = float(np.max(cand_d))
+            report, pair_metrics = self._pair_metrics(st, prefix="pre")
+            metrics.update({
+                "bond_min": cand_min,
+                "bond_max": cand_max,
+                "dmin_any": report.min_distance,
+            })
+            metrics.update(pair_metrics)
+            if report.violations:
+                return PreprocessResult(
+                    False,
+                    struct=st,
+                    reason=self._pair_violation_reason(report.violations[0]),
+                    metrics=metrics,
+                )
+            return PreprocessResult(True, struct=st, scale_ab=1.0, metrics=metrics)
+
+        ok, scaled, scale, extra_metrics, reason = self._apply_scaling(st, cand_d)
+        if not ok or scaled is None:
+            return PreprocessResult(False, struct=st, reason=reason, metrics=metrics)
+
+        metrics.update(extra_metrics)
+        return PreprocessResult(True, struct=scaled, scale_ab=scale, metrics=metrics)
+
+    def _apply_scaling(self, struct: Structure, cand_d: np.ndarray):
+        bond_min = self.args.bond_target_min
+        bond_max = self.args.bond_target_max
+        cand_min = float(np.min(cand_d))
+        cand_max = float(np.max(cand_d))
+        if cand_min <= 1e-6 or cand_max <= 1e-6:
+            return False, None, 1.0, {}, f"cand_min/cand_max 非法: {cand_min:.4f}/{cand_max:.4f}"
+
+        mode = getattr(self.args, "bond_scaling_mode", "soft").lower()
+        if mode == "strict":
+            s_lo = bond_min / cand_min
+            s_hi = bond_max / cand_max
+            if s_lo > s_hi:
+                return False, None, 1.0, {}, (
+                    f"无法同时缩放至 [{bond_min:.2f}, {bond_max:.2f}]Å，原始范围 {cand_min:.2f}–{cand_max:.2f}Å"
+                )
+            if s_lo <= 1.0 <= s_hi:
+                s_target = 1.0
+            else:
+                s_target = s_lo if abs(s_lo - 1.0) < abs(s_hi - 1.0) else s_hi
+        else:
+            d_med = float(np.median(cand_d))
+            if d_med <= 1e-6:
+                return False, None, 1.0, {}, f"soft 模式: d_med 非法 {d_med:.4f}"
+            target_mid = 0.5 * (bond_min + bond_max)
+            s_target = target_mid / d_med
+            s_min_shortest = bond_min / cand_min
+            if s_target < s_min_shortest:
+                s_target = s_min_shortest
+
+        s_target = max(0.5, min(s_target, 4.0))
+        L_old = struct.lattice
+        mat = L_old.matrix.copy()
+        mat[0, :] *= s_target
+        mat[1, :] *= s_target
+        scaled = Structure(
+            Lattice(mat),
+            [s.species for s in struct.sites],
+            [s.frac_coords for s in struct.sites],
+            coords_are_cartesian=False,
+        )
+
+        cand_d_scaled = compute_candidate_nn_distances(
+            scaled,
+            center_species=self.args.center_species,
+            neighbor_species=self.args.neighbor_species,
+            k_per_site=4,
+        )
+        cand_min_scaled = float(np.min(cand_d_scaled))
+        cand_max_scaled = float(np.max(cand_d_scaled))
+        report, pair_metrics = self._pair_metrics(scaled, prefix="scaled")
+        phys_min = report.min_distance
+
+        if report.violations:
+            return False, None, 1.0, pair_metrics, self._pair_violation_reason(report.violations[0])
+
+        if mode == "strict":
+            if cand_min_scaled < bond_min - 1e-3 or cand_max_scaled > bond_max + 1e-3:
+                return False, None, 1.0, {}, (
+                    f"strict 模式: 缩放后键长范围 {cand_min_scaled:.2f}–{cand_max_scaled:.2f}Å 不在目标区间"
+                )
+            if phys_min < bond_min - 1e-3:
+                return False, None, 1.0, {}, (
+                    f"strict 模式: 缩放后最短任意原子间距 {phys_min:.3f}Å < {bond_min:.2f}Å"
+                )
+            coverage = 1.0
+        else:
+            if phys_min < bond_min - 1e-3:
+                return False, None, 1.0, {}, (
+                    f"soft 模式: 缩放后最短任意原子间距 {phys_min:.3f}Å < {bond_min:.2f}Å"
+                )
+            mask_in = (cand_d_scaled >= bond_min - 1e-3) & (cand_d_scaled <= bond_max + 1e-3)
+            coverage = float(np.mean(mask_in))
+            if coverage < self.args.bond_coverage_min:
+                return False, None, 1.0, {}, (
+                    f"soft 模式: 仅 {coverage*100:.1f}% 键落在 [{bond_min:.2f}, {bond_max:.2f}]Å 内 < bond_coverage_min"
+                )
+
+        metrics = {
+            "bond_min": cand_min_scaled,
+            "bond_max": cand_max_scaled,
+            "dmin_any": phys_min,
+            "bond_coverage": coverage,
+            "scale_applied": s_target,
+            "bond_target_range": [bond_min, bond_max],
+        }
+        metrics.update(pair_metrics)
+        return True, scaled, s_target, metrics, None
+
+    def _pair_metrics(self, struct: Structure, prefix: str):
+        report = self.constraints.analyze_pairs(struct)
+        metrics = {
+            f"{prefix}_pair_min": report.min_distance,
+            f"{prefix}_pair_min_species": report.min_pair,
+            f"{prefix}_pair_violation_count": len(report.violations),
+            f"{prefix}_pair_violations": report.violations[:5],
+        }
+        return report, metrics
+
+    @staticmethod
+    def _pair_violation_reason(violation: Dict[str, object]) -> str:
+        spec_i = violation.get("species_i")
+        spec_j = violation.get("species_j")
+        dist = violation.get("distance")
+        thresh = violation.get("threshold")
+        return (
+            f"pair {spec_i}-{spec_j} 距离 {dist:.3f}Å < 阈值 {thresh:.3f}Å"
+            if dist is not None and thresh is not None
+            else "pair distance violation"
+        )
+
+
+class GeometryFilter:
+    def __init__(self,
+                 args,
+                 constraints: GeometryConstraints,
+                 symprecs: Sequence[float],
+                 projector: Optional[SlabProjector] = None):
+        self.args = args
+        self.constraints = constraints
+        self.symprecs = tuple(symprecs)
+        self.projector = projector
+
+    def filter(self, struct: Structure) -> FilterResult:
+        report = self.constraints.analyze_pairs(struct)
+        metrics: Dict[str, object] = {
+            "pair_min": report.min_distance,
+            "pair_min_species": report.min_pair,
+            "pair_violation_count": len(report.violations),
+            "pair_violations": report.violations,
+        }
+
+        st = struct
+        if self.projector and getattr(self.args, "reslab_after_relax", True):
+            st, _ = self.projector.project(st, with_metrics=False)
+        if report.violations:
+            relax_cfg = getattr(self.args, "post_gen_relax", {}) or {}
+            if relax_cfg.get("mode") == "hard_sphere":
+                relaxed, iterations = hard_sphere_relax(
+                    st,
+                    self.constraints,
+                    max_iter=relax_cfg.get("max_iter", 30),
+                    step=relax_cfg.get("step", 0.4),
+                )
+                if self.projector and getattr(self.args, "reslab_after_relax", True):
+                    relaxed, _ = self.projector.project(relaxed, with_metrics=False)
+                st = relaxed
+                report = self.constraints.analyze_pairs(st)
+                metrics["relax"] = {
+                    "mode": "hard_sphere",
+                    "iterations": iterations,
+                    "remaining_violations": len(report.violations),
+                }
+            if report.violations and self.constraints.reject_if_overlap:
+                reason = (
+                    f"最近原子距离 {report.min_distance:.3f}Å 违反硬球约束"
+                    if report.min_distance
+                    else "pair distance violation"
+                )
+                return FilterResult(False, struct=st, reason=reason, metrics=metrics)
+
+        metrics["pair_min_after"] = report.min_distance
+
+        if self.projector:
+            corr, thickness = surface_corrugation_angstrom(
+                st,
+                surface_frac=self.projector.surface_frac,
+                axis_index=self.projector.axis_index,
+            )
+            metrics["z_surf_corr_post"] = corr
+            metrics["z_thickness_post"] = thickness
+            if self.args.layer_thickness_max > 0 and thickness > self.args.layer_thickness_max + 1e-3:
+                return FilterResult(
+                    False,
+                    struct=st,
+                    reason=(
+                        f"thickness={thickness:.3f}Å > layer_thickness_max={self.args.layer_thickness_max:.3f}Å"
+                    ),
+                    metrics=metrics,
+                )
+            if corr > self.args.z_flat_tol:
+                return FilterResult(
+                    False,
+                    struct=st,
+                    reason=f"surface_corr={corr:.3f}Å > z_flat_tol={self.args.z_flat_tol:.3f}Å",
+                    metrics=metrics,
+                )
+
+        density = float(st.density)
+        metrics["density"] = density
+        if self.args.density_range is not None:
+            lo, hi = self.args.density_range
+            if not (lo <= density <= hi):
+                return FilterResult(
+                    False,
+                    struct=st,
+                    reason=f"density={density:.3f} g/cm^3 不在 [{lo}, {hi}] 区间",
+                    metrics=metrics,
+                )
+
+        symprec = self.symprecs[0] if self.symprecs else 1e-3
+        overlap_flag, overlap_meta = motif_overlap_report(
+            st,
+            self.constraints,
+            symprec=symprec,
+            angle_tolerance=self.args.angle_tol,
+            pad=self.args.motif_overlap_tol,
+        )
+        overlap_meta.setdefault("overlaps", [])
+        metrics["motif_overlap"] = overlap_meta
+        metrics["motif_overlap_flag"] = overlap_flag
+        if overlap_flag and self.constraints.reject_if_overlap:
+            return FilterResult(False, struct=st, reason="motif 重叠", metrics=metrics)
+
+        return FilterResult(True, struct=st, metrics=metrics)
+
+
+class CandidateEvaluator:
+    def __init__(self,
+                 args,
+                 ref_stats: dict,
+                 symprecs: Sequence[float],
+                 cn_range: Tuple[int, int],
+                 projector: Optional[SlabProjector] = None):
+        self.args = args
+        self.ref_stats = ref_stats
+        self.symprecs = tuple(symprecs)
+        self.cn_lo, self.cn_hi = cn_range
+        self.projector = projector
+
+    def evaluate(self,
+                 struct: Structure,
+                 sg_target: int,
+                 det2: int,
+                 scale_ab: float,
+                 base_meta: Dict[str, object]) -> EvaluatorResult:
+        cost, cost_stats = candidate_cost(
+            struct,
+            ref_stats=self.ref_stats,
+            bond_tol=self.args.bond_tol,
+            cn_target=self.args.cn_target,
+            w_d=self.args.w_cost_d,
+            w_cn=self.args.w_cost_cn,
+            center_species=self.args.center_species,
+            neighbor_species=self.args.neighbor_species,
+        )
+
+        CNs = cost_stats.get("CNs", [])
+        if not CNs:
+            return EvaluatorResult(False, reason="CN 统计为空")
+        if not all(self.cn_lo <= cn <= self.cn_hi for cn in CNs):
+            return EvaluatorResult(False, reason=f"CN={CNs} 超出 [{self.cn_lo}, {self.cn_hi}]")
+
+        ok_sg, sg_found, sym_used = verify_spacegroup_exact(
+            struct,
+            target_sg=sg_target,
+            symprecs=self.symprecs,
+            angle_tolerance=self.args.angle_tol,
+        )
+        if not ok_sg:
+            return EvaluatorResult(False, reason=f"识别空间群={sg_found} != 目标 SG={sg_target}")
+
+        prim = to_primitive(struct, symprec=sym_used or self.symprecs[0], angle_tolerance=self.args.angle_tol)
+        slab_metrics: Dict[str, object] = {}
+        if self.projector is not None:
+            prim, slab_metrics = self.projector.project(prim, with_metrics=True)
+
+        meta = dict(base_meta)
+        meta.update({
+            "sg_target": sg_target,
+            "sg_found": sg_found,
+            "det": det2,
+            "scale": scale_ab,
+            "symprec": sym_used,
+            "angle_tol": self.args.angle_tol,
+            "cost": cost,
+            "cost_stats": cost_stats,
+            "n_atoms": len(prim),
+        })
+        if slab_metrics:
+            meta.update(slab_metrics)
+        if "z_thickness" in meta and "z_ptp" not in meta:
+            meta["z_ptp"] = meta["z_thickness"]
+
+        return EvaluatorResult(True, primitive=prim, meta=meta)
+
+
 # ------------------------------ SG 验证与原胞化 ------------------------------
 
 def verify_spacegroup_exact(struct: Structure, target_sg: int, symprecs, angle_tolerance: float):
@@ -693,6 +1572,18 @@ def to_primitive(struct: Structure, symprec=1e-3, angle_tolerance=0.5) -> Struct
         return prim
     except Exception:
         return struct.copy()
+
+
+def detect_structure_sg(struct: Structure, symprecs, angle_tolerance: float):
+    """Return the first successfully detected space group for *struct*."""
+
+    for sp in symprecs:
+        try:
+            sga = SpacegroupAnalyzer(struct, symprec=sp, angle_tolerance=angle_tolerance)
+            return sga.get_space_group_number()
+        except Exception:
+            continue
+    return None
 
 
 def wyckoff_map_by_species(struct: Structure, symprec=1e-3, angle_tolerance=0.5):
@@ -742,7 +1633,8 @@ def main():
     if not os.path.exists(args.structure_file):
         raise FileNotFoundError(f"结构文件不存在: {args.structure_file}")
     base = Structure.from_file(args.structure_file)
-    base = ensure_vacuum_c(base, c_target_low=args.vacuum_c - 1.0, c_target_high=args.vacuum_c + 1.0)
+    slab_projector = SlabProjector(args)
+    base, _ = slab_projector.project(base, with_metrics=False)
 
     # 用用户指定的元素对做参考最近邻统计
     ref_stats = compute_nn_stats(
@@ -757,10 +1649,25 @@ def main():
         f"mean={ref_stats['mean']:.3f} Å  std={ref_stats['std']:.3f} Å"
     )
 
-    # 目标 SG 列表（示例：仅 26，可自行改为 1..230）
-    target_sgs = [sg for sg in range(26, 27) if sg != 39]
-
     symprecs = tuple(float(x) for x in args.symprec)
+
+    base_sg = detect_structure_sg(base, symprecs=symprecs, angle_tolerance=args.angle_tol)
+    if base_sg is not None:
+        print(f"[BASE] 输入结构识别空间群 SG={base_sg}")
+    else:
+        print("[BASE] 无法识别输入结构的空间群（将不会自动排除）")
+
+    exclude_sgs = set(args.exclude_sgs or [])
+    if args.target_sgs is not None:
+        target_sgs = [sg for sg in args.target_sgs if sg not in exclude_sgs]
+    else:
+        if base_sg is not None:
+            exclude_sgs.add(base_sg)
+        target_sgs = [sg for sg in range(1, 231) if sg not in exclude_sgs]
+
+    if not target_sgs:
+        raise ValueError("目标空间群列表为空，请检查 target_sgs/exclude_sgs 设置。")
+
     cn_lo, cn_hi = int(args.cn_range[0]), int(args.cn_range[1])
 
     # 基本信息：基胞里的元素计数（只算一次就行）
@@ -792,6 +1699,12 @@ def main():
         f"扩胞倍数 det 列表：{det_list}；pyxtal 可用：{_HAS_PYXTAL}"
     )
 
+    constraints = GeometryConstraints(args)
+    generator = CandidateGenerator(args)
+    preprocessor = CandidatePreprocessor(args, slab_projector, constraints)
+    geom_filter = GeometryFilter(args, constraints, symprecs, slab_projector)
+    evaluator = CandidateEvaluator(args, ref_stats, symprecs, (cn_lo, cn_hi), projector=slab_projector)
+
     for idx, sg in enumerate(target_sgs, 1):
         sg_dir = makedirs(os.path.join(outdir, f"SG_{sg:03d}"))
         log_path = os.path.join(log_dir, f"SG_{sg:03d}.log")
@@ -800,11 +1713,15 @@ def main():
         debug_dir = makedirs(os.path.join(sg_dir, "debug"))
         debug_counter = 0
 
-        def debug_save(struct: Structure, det2: int, scale_ab: float, tag: str):
+        def debug_save(struct: Optional[Structure], det2: int, scale_ab: float, tag: str, accepted: bool = False):
             nonlocal debug_counter
-            if not (args.debug_save_all_cands or args.debug_save_rejected):
+            if struct is None:
                 return
-            if debug_counter >= args.debug_max_per_sg:
+            if accepted:
+                should_save = args.debug_save_all_cands
+            else:
+                should_save = args.debug_save_all_cands or args.debug_save_rejected
+            if not should_save or debug_counter >= args.debug_max_per_sg:
                 return
             stem = f"cand_debug_det{det2}_scale{scale_ab:.4f}_{tag}_{debug_counter:03d}"
             save_structure_pair(struct, debug_dir, stem)
@@ -826,271 +1743,51 @@ def main():
                 append_log(log_path, f"[SKIP] det={det2}  未安装 pyxtal，无法枚举 Wyckoff")
                 continue
 
-            cands = pyxtal_generate_candidates(
-                sg,
-                num_center=num_center,
-                num_neighbor=num_neighbor,
-                center_species=args.center_species,
-                neighbor_species=args.neighbor_species,
-                trials=args.samples_per_sg
-            )
+            cands = generator.generate(sg, num_center=num_center, num_neighbor=num_neighbor)
             if not cands:
                 append_log(log_path, f"[FAIL] det={det2}  pyxtal 采样均失败")
                 continue
 
-            for st in cands:
-                # pyxtal 自由生成的 3D 晶格 + 原子排布
-                # 1) 先“套上二维真空”：只改 c，不改 a,b 和分数坐标
-                st = ensure_vacuum_c(
-                    st,
-                    c_target_low=args.vacuum_c - 1.0,
-                    c_target_high=args.vacuum_c + 1.0
-                )
-                # 2) 再把整体厚度压缩到 layer_thickness_max 以内（若该值>0）
-                st = squash_layer_thickness(st, args.layer_thickness_max)
+            for st_raw in cands:
+                debug_save(st_raw, det2, 1.0, "raw")
 
-                # 初始缩放因子（记录到 meta 里用）
-                scale_ab = 1.0
-
-                if args.debug_save_all_cands:
-                    debug_save(st, det2, scale_ab, "raw")
-
-                # --- 厚度与表面起伏约束 ---
-                surf_corr, thickness = surface_corrugation_angstrom(st, surface_frac=args.surface_frac)
-                if args.layer_thickness_max > 0 and thickness > args.layer_thickness_max + 1e-3:
-                    append_log(
-                        log_path,
-                        f"[REJ] det={det2}  thickness={thickness:.3f}Å > layer_thickness_max={args.layer_thickness_max}Å"
-                    )
-                    continue
-                if surf_corr > args.z_flat_tol:
-                    append_log(
-                        log_path,
-                        f"[REJ] det={det2}  surface_corr={surf_corr:.3f}Å > z_flat_tol={args.z_flat_tol}Å"
-                    )
+                pre_res = preprocessor.preprocess(st_raw)
+                if not pre_res.ok:
+                    append_log(log_path, f"[REJ][prep] det={det2}  {pre_res.reason}")
+                    debug_save(pre_res.struct or st_raw, det2, pre_res.scale_ab, "prep_fail")
                     continue
 
-                # --- 计算中心–邻居最近邻距离 & 全局最短距离 ---
-                try:
-                    cand_d = compute_candidate_nn_distances(
-                        st,
-                        center_species=args.center_species,
-                        neighbor_species=args.neighbor_species,
-                        k_per_site=4,
-                    )
-                except ValueError as e:
-                    append_log(log_path, f"[REJ] det={det2}  compute_candidate_nn_distances 失败: {e}")
+                debug_save(pre_res.struct, det2, pre_res.scale_ab, "prepped")
+
+                filt_res = geom_filter.filter(pre_res.struct)
+                if not filt_res.ok:
+                    append_log(log_path, f"[REJ][geom] det={det2}  {filt_res.reason}")
+                    debug_save(filt_res.struct or pre_res.struct, det2, pre_res.scale_ab, "geom_fail")
                     continue
 
-                if cand_d.size == 0:
-                    append_log(log_path, f"[REJ] det={det2}  无法获得任何 {args.center_species}-{args.neighbor_species} 最近邻键长")
+                combined_meta: Dict[str, object] = {}
+                combined_meta.update(pre_res.metrics)
+                combined_meta.update(filt_res.metrics)
+                if "pair_min_after" in combined_meta:
+                    combined_meta["dmin_any"] = combined_meta["pair_min_after"]
+
+                eval_res = evaluator.evaluate(filt_res.struct, sg, det2, pre_res.scale_ab, combined_meta)
+                if not eval_res.ok:
+                    append_log(log_path, f"[REJ][eval] det={det2}  {eval_res.reason}")
+                    debug_save(filt_res.struct, det2, pre_res.scale_ab, "eval_fail")
                     continue
 
-                cand_min = float(np.min(cand_d))
-                cand_max = float(np.max(cand_d))
-                phys_min = min_any_pair_distance(st)
+                prim = eval_res.primitive
+                meta = eval_res.meta
 
-                bond_min = args.bond_target_min
-                bond_max = args.bond_target_max
-
-                # --- 键长缩放逻辑（只缩放 a,b，不动 c；开关由 enable_bond_scaling 控制） ---
-                if args.enable_bond_scaling:
-                    if cand_min <= 1e-6 or cand_max <= 1e-6:
-                        append_log(
-                            log_path,
-                            f"[REJ] det={det2}  cand_min/cand_max 非法: {cand_min:.4f}/{cand_max:.4f}"
-                        )
-                        continue
-
-                    mode = getattr(args, "bond_scaling_mode", "strict").lower()
-
-                    if mode == "strict":
-                        # === 原来的严格模式：必须存在统一 s，使所有键都落在 [bond_min, bond_max] ===
-                        s_lo = bond_min / cand_min
-                        s_hi = bond_max / cand_max
-
-                        if s_lo > s_hi:
-                            # 区间无交集，无法用同一个缩放因子同时满足上下限
-                            append_log(
-                                log_path,
-                                f"[REJ] det={det2}  无法缩放到 [{bond_min:.2f}, {bond_max:.2f}]Å，"
-                                f"原始键长范围 {cand_min:.2f}–{cand_max:.2f}Å (strict)"
-                            )
-                            continue
-
-                        # 在可行区间 [s_lo, s_hi] 内选一个离 1 最近的缩放因子
-                        if s_lo <= 1.0 <= s_hi:
-                            s_target = 1.0
-                        else:
-                            s_target = s_lo if abs(s_lo - 1.0) < abs(s_hi - 1.0) else s_hi
-
-                        # 限制缩放系数
-                        s_target = max(0.5, min(s_target, 4.0))
-
-                    else:
-                        # === soft 模式：让中位数靠近区间中心，并保证最短键有机会被拉到 >= bond_min ===
-                        d_med = float(np.median(cand_d))
-                        if d_med <= 1e-6:
-                            append_log(
-                                log_path,
-                                f"[REJ] det={det2}  soft 模式: d_med 非法 {d_med:.4f}"
-                            )
-                            continue
-
-                        target_mid = 0.5 * (bond_min + bond_max)
-                        s_target = target_mid / d_med
-
-                        # 同时考虑把最短键拉到 >= bond_min
-                        s_min_for_shortest = bond_min / cand_min
-                        if s_target < s_min_for_shortest:
-                            s_target = s_min_for_shortest
-
-                        # 限制缩放系数
-                        s_target = max(0.5, min(s_target, 4.0))
-
-                    # === 应用 a,b 缩放（strict / soft 共用） ===
-                    L_old = st.lattice
-                    mat = L_old.matrix.copy()
-                    mat[0, :] *= s_target
-                    mat[1, :] *= s_target
-                    st = Structure(
-                        Lattice(mat),
-                        [s.species for s in st.sites],
-                        [s.frac_coords for s in st.sites],
-                        coords_are_cartesian=False
-                    )
-                    scale_ab = s_target
-
-                    # 缩放后重新计算键长
-                    cand_d = compute_candidate_nn_distances(
-                        st,
-                        center_species=args.center_species,
-                        neighbor_species=args.neighbor_species,
-                        k_per_site=4,
-                    )
-                    cand_min = float(np.min(cand_d))
-                    cand_max = float(np.max(cand_d))
-                    phys_min = min_any_pair_distance(st)
-
-                    if mode == "strict":
-                        # 严格：所有 center–neighbor 最近邻都必须在 [bond_min, bond_max] 内
-                        if cand_min < bond_min - 1e-3 or cand_max > bond_max + 1e-3:
-                            append_log(
-                                log_path,
-                                f"[REJ] det={det2}  strict 模式: 缩放后键长范围 "
-                                f"{cand_min:.2f}–{cand_max:.2f}Å 不在 [{bond_min:.2f}, {bond_max:.2f}]Å 内"
-                            )
-                            continue
-                        # 最短任意原子间距也要 >= bond_min
-                        if phys_min < bond_min - 1e-3:
-                            append_log(
-                                log_path,
-                                f"[REJ] det={det2}  strict 模式: 缩放后最短任意原子间距 "
-                                f"{phys_min:.3f}Å < {bond_min:.2f}Å"
-                            )
-                            continue
-                    else:
-                        # soft 模式：
-                        # 1) 仍然要求最短任意原子间距 >= bond_min
-                        if phys_min < bond_min - 1e-3:
-                            append_log(
-                                log_path,
-                                f"[REJ] det={det2}  soft 模式: 缩放后最短任意原子间距 "
-                                f"{phys_min:.3f}Å < {bond_min:.2f}Å"
-                            )
-                            continue
-
-                        # 2) 要求“足够比例”的 center–neighbor 键落在目标区间内
-                        mask_in = (cand_d >= bond_min - 1e-3) & (cand_d <= bond_max + 1e-3)
-                        frac_in = float(np.mean(mask_in))
-                        if frac_in < args.bond_coverage_min:
-                            append_log(
-                                log_path,
-                                f"[REJ] det={det2}  soft 模式: 仅 {frac_in*100:.1f}% 键在 "
-                                f"[{bond_min:.2f}, {bond_max:.2f}]Å 内 < bond_coverage_min="
-                                f"{args.bond_coverage_min:.2f}"
-                            )
-                            continue
-                else:
-                    # 不做 a,b 缩放，只用 min_pair_dist 做硬约束避免重叠
-                    if phys_min < args.min_pair_dist:
-                        append_log(
-                            log_path,
-                            f"[REJ] det={det2}  min-pair={phys_min:.3f}Å < {args.min_pair_dist}Å (未启用键长缩放)"
-                        )
-                        continue
-
-                # --- 计算 cost & CN 过滤 ---
-                cost, cost_stats = candidate_cost(
-                    st,
-                    ref_stats=ref_stats,
-                    bond_tol=args.bond_tol,
-                    cn_target=args.cn_target,
-                    w_d=args.w_cost_d,
-                    w_cn=args.w_cost_cn,
-                    center_species=args.center_species,
-                    neighbor_species=args.neighbor_species,
-                )
-
-                CNs = cost_stats.get("CNs", [])
-                if not CNs:
-                    append_log(log_path, f"[REJ] det={det2}  CN 统计为空")
-                    continue
-
-                if not all(cn_lo <= cn <= cn_hi for cn in CNs):
-                    append_log(
-                        log_path,
-                        f"[REJ] det={det2}  CN={CNs} 不在允许区间 [{cn_lo}, {cn_hi}] 内"
-                    )
-                    continue
-
-                # --- SG 验证 ---
-                ok_sg, sg_found, sym_used = verify_spacegroup_exact(
-                    st, target_sg=sg, symprecs=symprecs, angle_tolerance=args.angle_tol
-                )
-                if not ok_sg:
-                    append_log(
-                        log_path,
-                        f"[REJ] det={det2}  识别空间群={sg_found} != 目标 SG={sg}"
-                    )
-                    continue
-
-                # --- 转原胞 ---
-                prim = to_primitive(st, symprec=sym_used or symprecs[0], angle_tolerance=args.angle_tol)
-
-                # --- 去重：避免同一个 SG 下结构重复 ---
-                is_dup = False
-                for item in found:
-                    if matchers[sg].fit(prim, item["primitive"]):
-                        is_dup = True
-                        break
+                is_dup = any(matchers[sg].fit(prim, item["primitive"]) for item in found)
                 if is_dup:
                     append_log(log_path, f"[SKIP] det={det2}  发现重复结构，跳过")
+                    debug_save(prim, det2, pre_res.scale_ab, "dup")
                     continue
 
-                # --- 记录候选 ---
-                meta = {
-                    "sg_target": sg,
-                    "sg_found": sg_found,
-                    "det": det2,
-                    "scale": scale_ab,
-                    "symprec": sym_used,
-                    "angle_tol": args.angle_tol,
-                    "cost": cost,
-                    "cost_stats": cost_stats,
-                    "dmin_any": phys_min,
-                    "bond_min": cand_min,
-                    "bond_max": cand_max,
-                    "bond_target_range": [bond_min, bond_max],
-                    "z_thickness": thickness,
-                    "z_surf_corr": surf_corr,
-                    "z_ptp": thickness,   # 为了兼容旧的字段名，仍然记录一份
-                    "n_atoms": len(prim),
-                }
                 found.append({"primitive": prim, "meta": meta})
-
-                if args.debug_save_all_cands:
-                    debug_save(prim, det2, scale_ab, "accepted")
+                debug_save(prim, det2, pre_res.scale_ab, "accepted", accepted=True)
 
         # 每个 SG 只保留 topk
         found = sorted(found, key=lambda x: (x["meta"]["cost"], -x["meta"]["dmin_any"]))[:args.topk]
