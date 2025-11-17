@@ -526,6 +526,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "debug_save_all_cands": False,   # 保存所有 pyxtal 生成的候选
         "debug_save_rejected": False,    #（预留，目前未单独区分）
         "debug_max_per_sg": 50,
+        "process_all_candidates": False,  # 若为 True，不在中间阶段提前跳过，尽量跑完全流程
 
         # 键长目标区间（Å）
         "bond_target_min": 2.2,
@@ -2174,6 +2175,7 @@ def main():
 
         debug_dir = makedirs(os.path.join(sg_dir, "debug"))
         debug_counter = 0
+        process_all = as_bool(getattr(args, "process_all_candidates", False))
 
         def debug_save(struct: Optional[Structure], det2: int, scale_ab: float, tag: str, accepted: bool = False):
             nonlocal debug_counter
@@ -2209,6 +2211,8 @@ def main():
                 continue
 
             for cand_idx, st_raw in enumerate(cands, 1):
+                rejected = False
+                reject_reasons: List[str] = []
                 debug_save(st_raw, det2, 1.0, "raw")
 
                 current_struct = st_raw
@@ -2216,8 +2220,9 @@ def main():
                 is_valid, reason = is_structure_valid(current_struct, args.filters)
                 if not is_valid:
                     append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  {reason}")
-                    debug_save(st_raw, det2, 1.0, "filter_fail")
-                    continue
+                    reject_reasons.append(reason or "failed quick filter")
+                    if not process_all:
+                        continue
 
                 vacuum_was_fixed = False
                 if vacuum_filter_cfg.get("enable_vacuum_check", True):
@@ -2232,14 +2237,16 @@ def main():
                                 fixed_struct, _ = auto_fix_vacuum_with_pymatgen(current_struct, target_vac, axis)
                             except Exception as exc:
                                 append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  auto-fix vacuum failed: {exc}")
-                                debug_save(current_struct, det2, 1.0, "vacuum_fix_fail")
-                                continue
+                                reject_reasons.append("vacuum auto-fix failed")
+                                if not process_all:
+                                    continue
 
                             has_vac, vac_thickness, vac_detail = has_sufficient_vacuum(fixed_struct, min_vac, axis)
                             if not has_vac:
                                 append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  auto-fix vacuum insufficient: {vac_detail}")
-                                debug_save(fixed_struct, det2, 1.0, "vacuum_fix_fail")
-                                continue
+                                reject_reasons.append("vacuum insufficient after fix")
+                                if not process_all:
+                                    continue
 
                             current_struct = fixed_struct
                             vacuum_was_fixed = True
@@ -2250,8 +2257,9 @@ def main():
                             )
                         else:
                             append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  no sufficient vacuum: {vac_detail}")
-                            debug_save(current_struct, det2, 1.0, "vacuum_fail")
-                            continue
+                            reject_reasons.append("vacuum insufficient")
+                            if not process_all:
+                                continue
 
                 if vacuum_was_fixed and spacegroup_filter_cfg.get("enable_spacegroup_check_after_fix", False):
                     try:
@@ -2262,8 +2270,9 @@ def main():
                         )
                     except Exception as exc:
                         append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  spacegroup check failed: {exc}")
-                        debug_save(current_struct, det2, 1.0, "spacegroup_fail")
-                        continue
+                        reject_reasons.append("spacegroup check failed")
+                        if not process_all:
+                            continue
 
                     if not is_spacegroup_acceptable(sg_symbol, sg_number, spacegroup_filter_cfg):
                         append_log(
@@ -2271,17 +2280,20 @@ def main():
                             (f"[FILTER] det={det2} cand={cand_idx}  spacegroup mismatch after vacuum fix: "
                              f"{sg_symbol} ({sg_number})"),
                         )
-                        debug_save(current_struct, det2, 1.0, "spacegroup_fail")
-                        continue
+                        reject_reasons.append("spacegroup mismatch after vacuum fix")
+                        if not process_all:
+                            continue
 
                     append_log(log_path, f"[KEEP] det={det2} cand={cand_idx}  spacegroup after vacuum fix: {sg_symbol} ({sg_number})")
 
                 pre_res = preprocessor.preprocess(current_struct)
                 if not pre_res.ok:
                     append_log(log_path, f"[REJ][prep] det={det2}  {pre_res.reason}")
-                    continue
+                    reject_reasons.append(pre_res.reason or "preprocess failed")
+                    if not process_all:
+                        continue
 
-                working_struct = pre_res.struct
+                working_struct = pre_res.struct or current_struct
                 scale_ab = pre_res.scale_ab
 
                 distance_filter_cfg = getattr(args, "distance_filter", {}) or {}
@@ -2304,7 +2316,9 @@ def main():
                             log_path,
                             (f"[REJ][prep] det={det2} auto-scale failed, min_dist={dist_report.get('min_distance', 0.0):.3f}Å"),
                         )
-                        continue
+                        reject_reasons.append("auto-scale failed")
+                        if not process_all:
+                            continue
                     working_struct = scaled_struct
                     scale_ab *= scale_factor
                     append_log(
@@ -2317,19 +2331,25 @@ def main():
                 final_report = collect_distance_violations(working_struct, distance_filter_cfg)
                 if final_report.get("violations"):
                     append_log(log_path, f"[REJ][prep] det={det2} still has short bonds after scaling")
-                    continue
+                    reject_reasons.append("short bonds remain after scaling")
+                    if not process_all:
+                        continue
 
                 cnn_ok, cnn_detail = is_bonding_reasonable_with_crystalnn(working_struct, args.__dict__, logger=None)
                 if not cnn_ok:
                     append_log(log_path, f"[REJ][cnn] det={det2} {cnn_detail}")
-                    continue
+                    reject_reasons.append(cnn_detail or "CrystalNN rejected")
+                    if not process_all:
+                        continue
                 if cnn_detail:
                     append_log(log_path, f"[CNN][info] det={det2} {cnn_detail}")
 
                 filt_res = geom_filter.filter(working_struct)
                 if not filt_res.ok:
                     append_log(log_path, f"[REJ][geom] det={det2}  {filt_res.reason}")
-                    continue
+                    reject_reasons.append(filt_res.reason or "geometry filter failed")
+                    if not process_all:
+                        continue
 
                 combined_meta: Dict[str, object] = {}
                 combined_meta.update(pre_res.metrics)
@@ -2343,10 +2363,16 @@ def main():
                 eval_res = evaluator.evaluate(filt_res.struct, sg, det2, scale_ab, combined_meta)
                 if not eval_res.ok:
                     append_log(log_path, f"[REJ][eval] det={det2}  {eval_res.reason}")
-                    continue
+                    reject_reasons.append(eval_res.reason or "evaluation failed")
+                    if not process_all:
+                        continue
 
                 prim = eval_res.primitive
                 meta = eval_res.meta
+
+                if reject_reasons:
+                    append_log(log_path, f"[REJ] det={det2}  skipped due to earlier failures: {'; '.join(reject_reasons)}")
+                    continue
 
                 is_dup = any(matchers[sg].fit(prim, item["primitive"]) for item in found)
                 if is_dup:

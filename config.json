@@ -66,6 +66,7 @@
     "debug_save_all_cands": true,
     "debug_save_rejected": true,
     "debug_max_per_sg": 30,
+    "process_all_candidates": false,
 
     "filters": {
       "enable_min_distance_filter": true,
