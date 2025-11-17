@@ -38,6 +38,17 @@
       "step": 0.4
     },
 
+    "motif_hard_dmin": 1.5,
+    "motif_box_scale": 6.0,
+    "motif_box_size": null,
+    "motif_max_tries": 80,
+    "motif_max_cost": 8.0,
+    "motif_local_steps": 15,
+    "motif_perturb_sigma": 0.1,
+    "motif_short_dist_factor": 0.7,
+    "motif_w_cn": 1.0,
+    "motif_w_d": 1.0,
+
     "z_flat_tol": 1.0,
 
     "ab_scale": 0.05,
