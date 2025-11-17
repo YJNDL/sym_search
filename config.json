@@ -19,10 +19,19 @@
     "z_flat_tol": 2.0,
     "surface_frac": 0.25,
 
-    "min_pair_dist_matrix": {
-      "Ga-Ga": 2.6,
-      "Ga-Sb": 2.3,
-      "Sb-Sb": 2.6
+    "distance_filter": {
+      "enable": true,
+      "global_min_distance": 2.4,
+      "min_pair_dist_matrix": {
+        "Ga-Ga": 2.6,
+        "Ga-Sb": 2.3,
+        "Sb-Sb": 2.6
+      },
+      "auto_scale": {
+        "enable": true,
+        "safety_margin": 0.05,
+        "max_scale_factor": 1.5
+      }
     },
     "min_bond_length_factor": 0.9,
     "hard_sphere_radius_scale": 0.95,
@@ -62,11 +71,6 @@
       "enable_min_distance_filter": true,
       "min_interatomic_distance": 1.2
     },
-    "distance_auto_scale": {
-      "enable": true,
-      "target_min_distance": 2.5,
-      "safety_margin": 0.05
-    },
     "vacuum_filter": {
       "enable_vacuum_check": true,
       "min_vacuum_thickness_angstrom": 8.0,
@@ -82,6 +86,12 @@
       "target_spacegroup_symbol": null,
       "symprec": 0.001,
       "angle_tolerance": 5.0
+    },
+    "crystalnn_filter": {
+      "enable": true,
+      "distance_cutoff": 3.5,
+      "max_unphysical_bond_fraction": 0.1,
+      "min_global_distance_after_cnn": 2.4
     }
   }
 }

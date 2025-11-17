@@ -55,6 +55,7 @@ import numpy as np
 from pymatgen.core import Structure, Lattice
 from pymatgen.core.periodic_table import Element
 from pymatgen.analysis.structure_matcher import StructureMatcher
+from pymatgen.analysis.local_env import CrystalNN
 from pymatgen.io.cif import CifWriter
 from pymatgen.io.vasp import Poscar
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
@@ -209,7 +210,7 @@ class GeometryConstraints:
     def pair_threshold(self, elem_a: str, elem_b: str) -> float:
         key = tuple(sorted((elem_a.lower(), elem_b.lower())))
         if key in self.min_pair_matrix:
-            return float(self.min_pair_matrix[key])
+            return max(float(self.min_pair_matrix[key]), self.min_pair_dist)
         ra = self._element_radius(elem_a)
         rb = self._element_radius(elem_b)
         fallback = self.min_pair_dist
@@ -429,10 +430,15 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "min_interatomic_distance": 1.2,
     }
 
-    distance_auto_scale_defaults = {
+    distance_filter_defaults = {
         "enable": True,
-        "target_min_distance": 2.5,
-        "safety_margin": 0.05,
+        "global_min_distance": 2.4,
+        "min_pair_dist_matrix": {},
+        "auto_scale": {
+            "enable": True,
+            "safety_margin": 0.05,
+            "max_scale_factor": 1.5,
+        },
     }
 
     vacuum_filter_defaults = {
@@ -452,6 +458,13 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "target_spacegroup_symbol": None,
         "symprec": 1e-3,
         "angle_tolerance": 5.0,
+    }
+
+    crystalnn_filter_defaults = {
+        "enable": True,
+        "distance_cutoff": 3.5,
+        "max_unphysical_bond_fraction": 0.1,
+        "min_global_distance_after_cnn": 2.4,
     }
 
     defaults = {
@@ -531,20 +544,22 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "exclude_sgs": [],
 
         "filters": filter_defaults,
-        "distance_auto_scale": distance_auto_scale_defaults,
+        "distance_filter": distance_filter_defaults,
         "vacuum_filter": vacuum_filter_defaults,
         "vacuum_auto_fix": vacuum_auto_fix_defaults,
         "spacegroup_filter": spacegroup_filter_defaults,
+        "crystalnn_filter": crystalnn_filter_defaults,
     }
 
     # 合并默认和用户设置
     settings_filters = settings.get("filters", {}) if isinstance(settings, dict) else {}
-    params = {**defaults, **{k: v for k, v in settings.items() if k not in {"filters", "distance_auto_scale", "vacuum_filter", "vacuum_auto_fix", "spacegroup_filter"}}}
+    params = {**defaults, **{k: v for k, v in settings.items() if k not in {"filters", "distance_filter", "vacuum_filter", "vacuum_auto_fix", "spacegroup_filter", "crystalnn_filter"}}}
     params["filters"] = {**filter_defaults, **settings_filters}
-    params["distance_auto_scale"] = {**distance_auto_scale_defaults, **settings.get("distance_auto_scale", {})}
+    params["distance_filter"] = {**distance_filter_defaults, **settings.get("distance_filter", {})}
     params["vacuum_filter"] = {**vacuum_filter_defaults, **settings.get("vacuum_filter", {})}
     params["vacuum_auto_fix"] = {**vacuum_auto_fix_defaults, **settings.get("vacuum_auto_fix", {})}
     params["spacegroup_filter"] = {**spacegroup_filter_defaults, **settings.get("spacegroup_filter", {})}
+    params["crystalnn_filter"] = {**crystalnn_filter_defaults, **settings.get("crystalnn_filter", {})}
 
     # 规范类型
     # symprec: 列表
@@ -566,20 +581,23 @@ def load_settings(config_path: str) -> argparse.Namespace:
         params[key] = as_bool(params.get(key))
 
     params["filters"]["enable_min_distance_filter"] = as_bool(params["filters"].get("enable_min_distance_filter", True))
-    params["distance_auto_scale"]["enable"] = as_bool(params["distance_auto_scale"].get("enable", True))
+    params["distance_filter"]["enable"] = as_bool(params["distance_filter"].get("enable", True))
+    params["distance_filter"]["auto_scale"]["enable"] = as_bool(params["distance_filter"].get("auto_scale", {}).get("enable", True))
     params["vacuum_filter"]["enable_vacuum_check"] = as_bool(params["vacuum_filter"].get("enable_vacuum_check", True))
     params["vacuum_auto_fix"]["enable_auto_fix"] = as_bool(params["vacuum_auto_fix"].get("enable_auto_fix", True))
     params["spacegroup_filter"]["enable_spacegroup_check_after_fix"] = as_bool(
         params["spacegroup_filter"].get("enable_spacegroup_check_after_fix", True)
     )
+    params["crystalnn_filter"]["enable"] = as_bool(params["crystalnn_filter"].get("enable", True))
 
     params["filters"]["min_interatomic_distance"] = float(params["filters"].get("min_interatomic_distance", 1.2))
-    params["distance_auto_scale"]["target_min_distance"] = float(
-        params["distance_auto_scale"].get("target_min_distance", 2.5)
-    )
-    params["distance_auto_scale"]["safety_margin"] = float(
-        params["distance_auto_scale"].get("safety_margin", 0.0)
-    )
+    df_cfg = params["distance_filter"]
+    df_cfg["global_min_distance"] = float(df_cfg.get("global_min_distance", 2.4))
+    df_cfg["min_pair_dist_matrix"] = parse_pair_distance_matrix(df_cfg.get("min_pair_dist_matrix", {}))
+    auto_cfg = df_cfg.get("auto_scale", {})
+    auto_cfg["safety_margin"] = float(auto_cfg.get("safety_margin", 0.0))
+    auto_cfg["max_scale_factor"] = float(auto_cfg.get("max_scale_factor", 1.5))
+    df_cfg["auto_scale"] = auto_cfg
     params["vacuum_filter"]["min_vacuum_thickness_angstrom"] = float(
         params["vacuum_filter"].get("min_vacuum_thickness_angstrom", 8.0)
     )
@@ -602,7 +620,8 @@ def load_settings(config_path: str) -> argparse.Namespace:
     # 数值
     params["bond_target_min"] = float(params["bond_target_min"])
     params["bond_target_max"] = float(params["bond_target_max"])
-    params["min_pair_dist"] = float(params["min_pair_dist"])
+    params["min_pair_dist"] = float(df_cfg.get("global_min_distance", params.get("min_pair_dist", 1.8)))
+    params["min_pair_dist_matrix"] = df_cfg.get("min_pair_dist_matrix", {})
     params["min_bond_length_factor"] = float(params.get("min_bond_length_factor", 0.9))
     params["hard_sphere_radius_scale"] = float(params.get("hard_sphere_radius_scale", 0.95))
     params["motif_overlap_tol"] = float(params.get("motif_overlap_tol", 0.25))
@@ -876,28 +895,27 @@ def auto_fix_vacuum_with_pymatgen(structure: Structure,
 
 def auto_scale_slab_for_short_bonds(structure: Structure,
                                     violations: Sequence[Dict[str, object]],
-                                    constraints: GeometryConstraints,
-                                    config: Optional[Dict[str, object]] = None):
+                                    distance_filter_cfg: Dict[str, object]):
     """Isotropically scale the lattice to eliminate short bonds."""
 
     if structure is None:
         return None, 1.0, None
 
-    config = config or {}
     if not violations:
-        report = constraints.analyze_pairs(structure)
-        return structure.copy(), 1.0, report
+        return structure.copy(), 1.0, None
 
-    if not as_bool(config.get("enable", True)):
+    if not as_bool(distance_filter_cfg.get("enable", True)):
         return None, 1.0, None
 
-    target_min = float(config.get("target_min_distance", 2.5))
-    margin = max(0.0, float(config.get("safety_margin", 0.0)))
+    auto_cfg = distance_filter_cfg.get("auto_scale", {}) or {}
+    target_min = float(distance_filter_cfg.get("global_min_distance", 0.0))
+    margin = max(0.0, float(auto_cfg.get("safety_margin", 0.0)))
+    max_scale = float(auto_cfg.get("max_scale_factor", 1.5))
 
     scale_factor = 1.0
     for violation in violations:
-        dist = float(violation.get("distance") or 0.0)
-        thresh = float(violation.get("threshold") or 0.0)
+        dist = float(violation.get("distance") or violation.get("dist") or 0.0)
+        thresh = float(violation.get("threshold") or violation.get("thresh") or 0.0)
         if dist <= 1e-8:
             dist = 1e-8
         target_ij = max(target_min, thresh)
@@ -910,6 +928,9 @@ def auto_scale_slab_for_short_bonds(structure: Structure,
     if scale_factor <= 1.0:
         scale_factor = 1.0 + margin
 
+    if scale_factor > max_scale:
+        return None, scale_factor, None
+
     try:
         scaled = structure.copy()
         new_volume = float(structure.volume) * (scale_factor ** 3)
@@ -917,11 +938,98 @@ def auto_scale_slab_for_short_bonds(structure: Structure,
     except Exception:
         return None, scale_factor, None
 
-    report = constraints.analyze_pairs(scaled)
-    if report.violations:
-        return None, scale_factor, report
+    return scaled, scale_factor, None
 
-    return scaled, scale_factor, report
+
+def _pair_threshold_from_cfg(elem_a: str, elem_b: str, distance_filter_cfg: Dict[str, object]) -> float:
+    cfg = distance_filter_cfg or {}
+    global_min = float(cfg.get("global_min_distance", 0.0))
+    matrix = cfg.get("min_pair_dist_matrix", {}) or {}
+    key = tuple(sorted((str(elem_a).lower(), str(elem_b).lower())))
+    thresh = float(matrix.get(key, global_min))
+    return max(global_min, thresh)
+
+
+def collect_distance_violations(structure: Structure,
+                                distance_filter_cfg: Dict[str, object]):
+    lattice = structure.lattice
+    frac = np.array([s.frac_coords for s in structure.sites], dtype=float)
+    species = [s.species_string for s in structure.sites]
+    n = len(species)
+    violations: List[Dict[str, object]] = []
+    dmin = float("inf")
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            df = min_image_vec(frac[j] - frac[i])
+            dist = float(np.linalg.norm(df @ lattice.matrix))
+            if dist < dmin:
+                dmin = dist
+            thresh = _pair_threshold_from_cfg(species[i], species[j], distance_filter_cfg)
+            if dist < thresh:
+                violations.append({
+                    "i": i,
+                    "j": j,
+                    "elem1": species[i],
+                    "elem2": species[j],
+                    "dist": dist,
+                    "thresh": thresh,
+                    "pair_label": f"{species[i]}-{species[j]}",
+                })
+
+    if dmin == float("inf"):
+        dmin = 0.0
+
+    return {
+        "min_distance": dmin,
+        "violations": violations,
+    }
+
+
+def is_bonding_reasonable_with_crystalnn(structure: Structure,
+                                         config: Dict[str, object],
+                                         logger=None):
+    cfg = config.get("crystalnn_filter", {}) or {}
+    if not as_bool(cfg.get("enable", True)):
+        return True, ""
+
+    kwargs = {}
+    if cfg.get("distance_cutoff") is not None:
+        kwargs["distance_cutoff"] = float(cfg.get("distance_cutoff"))
+    cnn = CrystalNN(**kwargs)
+    df_cfg = config.get("distance_filter", {}) or {}
+    total = 0
+    bad = 0
+    min_after = float(cfg.get("min_global_distance_after_cnn", df_cfg.get("global_min_distance", 0.0)))
+
+    for i in range(len(structure)):
+        try:
+            nn_info = cnn.get_nn_info(structure, i)
+        except Exception as exc:
+            if logger:
+                logger.info(f"CrystalNN failed on site {i}: {exc}")
+            return False, f"CrystalNN failed on site {i}: {exc}"
+        for nn in nn_info:
+            site = nn.get("site")
+            if site is None:
+                continue
+            dist = float(site.distance(structure[i]))
+            total += 1
+            thresh = max(min_after, _pair_threshold_from_cfg(site.species_string, structure[i].species_string, df_cfg))
+            if dist < thresh:
+                bad += 1
+
+    if total == 0:
+        return True, ""
+
+    frac_bad = bad / total
+    max_bad = float(cfg.get("max_unphysical_bond_fraction", 0.0))
+    if bad > 0 and frac_bad > max_bad:
+        detail = f"too many unphysical bonds by CrystalNN (bad/total = {bad}/{total})"
+        return False, detail
+
+    detail = f"bad/total bonds = {bad}/{total}" if bad or logger else ""
+    return True, detail
 
 
 def get_spacegroup_info(structure: Structure,
@@ -1489,7 +1597,8 @@ class CandidatePreprocessor:
         self.args = args
         self.projector = projector
         self.constraints = constraints
-        self.distance_auto_scale_cfg = getattr(args, "distance_auto_scale", {}) or {}
+        df_cfg = getattr(args, "distance_filter", {}) or {}
+        self.distance_auto_scale_cfg = df_cfg.get("auto_scale", {})
 
     def preprocess(self, struct: Structure) -> PreprocessResult:
         st, slab_metrics = self.projector.project(struct, with_metrics=True)
@@ -1675,17 +1784,17 @@ class CandidatePreprocessor:
                 f"short bonds detected but distance_auto_scale disabled (min_dist={report.min_distance:.3f}Å)"
             )
             return None, report, 1.0, reason
-        scaled_struct, scale_factor, scaled_report = auto_scale_slab_for_short_bonds(
+        scaled_struct, scale_factor, _ = auto_scale_slab_for_short_bonds(
             struct,
             report.violations,
-            self.constraints,
-            cfg,
+            getattr(self.args, "distance_filter", {}) or {},
         )
-        if scaled_struct is None or scaled_report is None:
+        if scaled_struct is None:
             reason = f"auto-scale failed for short bonds (min_dist={report.min_distance:.3f}Å)"
             return None, report, scale_factor, reason
-        if scaled_report.violations:
-            reason = f"still has short bonds after scaling (min_dist={scaled_report.min_distance:.3f}Å)"
+        scaled_report = collect_distance_violations(scaled_struct, getattr(self.args, "distance_filter", {}) or {})
+        if scaled_report.get("violations"):
+            reason = f"still has short bonds after scaling (min_dist={scaled_report.get('min_distance', 0.0):.3f}Å)"
             return None, scaled_report, scale_factor, reason
         return scaled_struct, scaled_report, scale_factor, None
 
@@ -1695,7 +1804,7 @@ class CandidatePreprocessor:
             "scale_factor": float(scale_factor),
             "min_before": float(before),
             "min_after": float(after),
-            "target_min_distance": float(cfg.get("target_min_distance", 2.5)),
+            "target_min_distance": float(getattr(self.args, "distance_filter", {}).get("global_min_distance", 2.5)),
             "safety_margin": float(cfg.get("safety_margin", 0.0)),
         }
 
@@ -2064,11 +2173,9 @@ def main():
             nonlocal debug_counter
             if struct is None:
                 return
-            if accepted:
-                should_save = args.debug_save_all_cands
-            else:
-                should_save = args.debug_save_all_cands or args.debug_save_rejected
-            if not should_save or debug_counter >= args.debug_max_per_sg:
+            if not accepted:
+                return
+            if debug_counter >= args.debug_max_per_sg:
                 return
             stem = f"cand_debug_det{det2}_scale{scale_ab:.4f}_{tag}_{debug_counter:03d}"
             save_structure_pair(struct, debug_dir, stem)
@@ -2164,49 +2271,72 @@ def main():
                     append_log(log_path, f"[KEEP] det={det2} cand={cand_idx}  spacegroup after vacuum fix: {sg_symbol} ({sg_number})")
 
                 pre_res = preprocessor.preprocess(current_struct)
-                scale_meta = pre_res.metrics.get("distance_auto_scale") if pre_res.metrics else None
-                if scale_meta:
-                    scale_factor = scale_meta.get("scale_factor")
-                    before = scale_meta.get("min_before")
-                    after = scale_meta.get("min_after")
-                    target = scale_meta.get("target_min_distance")
-                    if scale_factor and before is not None and after is not None:
-                        msg = (
-                            f"[SCALE][prep] det={det2} scale_factor={scale_factor:.3f}, "
-                            f"min_dist: {before:.3f}Å -> {after:.3f}Å"
-                        )
-                        if target is not None:
-                            msg += f" (target ≥ {target:.3f}Å)"
-                        append_log(log_path, msg)
-                        if pre_res.ok:
-                            append_log(
-                                log_path,
-                                (f"[KEEP][prep] det={det2} structure kept after scaling "
-                                 f"(scale_factor={scale_factor:.3f})"),
-                            )
                 if not pre_res.ok:
                     append_log(log_path, f"[REJ][prep] det={det2}  {pre_res.reason}")
-                    debug_save(pre_res.struct or current_struct, det2, pre_res.scale_ab, "prep_fail")
                     continue
 
-                debug_save(pre_res.struct, det2, pre_res.scale_ab, "prepped")
+                working_struct = pre_res.struct
+                scale_ab = pre_res.scale_ab
 
-                filt_res = geom_filter.filter(pre_res.struct)
+                distance_filter_cfg = getattr(args, "distance_filter", {}) or {}
+                dist_report = collect_distance_violations(working_struct, distance_filter_cfg)
+                violations = dist_report.get("violations", [])
+                if violations:
+                    for v in violations:
+                        append_log(
+                            log_path,
+                            (f"[WARN][prep] det={det2}  pair {v['pair_label']} 距离 {v['dist']:.3f}Å < "
+                             f"阈值 {v['thresh']:.3f}Å"),
+                        )
+                    scaled_struct, scale_factor, _ = auto_scale_slab_for_short_bonds(
+                        working_struct,
+                        violations,
+                        distance_filter_cfg,
+                    )
+                    if scaled_struct is None:
+                        append_log(
+                            log_path,
+                            (f"[REJ][prep] det={det2} auto-scale failed, min_dist={dist_report.get('min_distance', 0.0):.3f}Å"),
+                        )
+                        continue
+                    working_struct = scaled_struct
+                    scale_ab *= scale_factor
+                    append_log(
+                        log_path,
+                        (f"[SCALE][prep] det={det2} scale_factor={scale_factor:.3f}, "
+                         f"min_dist: {dist_report.get('min_distance', 0.0):.2f}Å -> >= "
+                         f"{distance_filter_cfg.get('global_min_distance', 0.0):.2f}Å"),
+                    )
+
+                final_report = collect_distance_violations(working_struct, distance_filter_cfg)
+                if final_report.get("violations"):
+                    append_log(log_path, f"[REJ][prep] det={det2} still has short bonds after scaling")
+                    continue
+
+                cnn_ok, cnn_detail = is_bonding_reasonable_with_crystalnn(working_struct, args.__dict__, logger=None)
+                if not cnn_ok:
+                    append_log(log_path, f"[REJ][cnn] det={det2} {cnn_detail}")
+                    continue
+                if cnn_detail:
+                    append_log(log_path, f"[CNN][info] det={det2} {cnn_detail}")
+
+                filt_res = geom_filter.filter(working_struct)
                 if not filt_res.ok:
                     append_log(log_path, f"[REJ][geom] det={det2}  {filt_res.reason}")
-                    debug_save(filt_res.struct or pre_res.struct, det2, pre_res.scale_ab, "geom_fail")
                     continue
 
                 combined_meta: Dict[str, object] = {}
                 combined_meta.update(pre_res.metrics)
                 combined_meta.update(filt_res.metrics)
-                if "pair_min_after" in combined_meta:
-                    combined_meta["dmin_any"] = combined_meta["pair_min_after"]
+                combined_meta["dmin_any"] = max(
+                    combined_meta.get("dmin_any", 0.0),
+                    final_report.get("min_distance", 0.0),
+                )
+                combined_meta["scale"] = scale_ab
 
-                eval_res = evaluator.evaluate(filt_res.struct, sg, det2, pre_res.scale_ab, combined_meta)
+                eval_res = evaluator.evaluate(filt_res.struct, sg, det2, scale_ab, combined_meta)
                 if not eval_res.ok:
                     append_log(log_path, f"[REJ][eval] det={det2}  {eval_res.reason}")
-                    debug_save(filt_res.struct, det2, pre_res.scale_ab, "eval_fail")
                     continue
 
                 prim = eval_res.primitive
@@ -2215,11 +2345,17 @@ def main():
                 is_dup = any(matchers[sg].fit(prim, item["primitive"]) for item in found)
                 if is_dup:
                     append_log(log_path, f"[SKIP] det={det2}  发现重复结构，跳过")
-                    debug_save(prim, det2, pre_res.scale_ab, "dup")
                     continue
 
                 found.append({"primitive": prim, "meta": meta})
-                debug_save(prim, det2, pre_res.scale_ab, "accepted", accepted=True)
+                append_log(
+                    log_path,
+                    (
+                        f"[KEEP] det={det2} final structure accepted "
+                        f"(min_dist>={distance_filter_cfg.get('global_min_distance', 0.0):.2f}Å)"
+                    ),
+                )
+                debug_save(prim, det2, scale_ab, "accepted", accepted=True)
 
         # 每个 SG 只保留 topk
         found = sorted(found, key=lambda x: (x["meta"]["cost"], -x["meta"]["dmin_any"]))[:args.topk]
