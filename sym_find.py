@@ -59,10 +59,13 @@ from pymatgen.io.cif import CifWriter
 from pymatgen.io.vasp import Poscar
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
-# pyxtal（可选）
+from motif_builder import MotifBuilder
+
+# pyxtal（可选，用于提示缺失）
 try:
-    from pyxtal import pyxtal as _pyxtal
-    _HAS_PYXTAL = True
+    import importlib.util
+
+    _HAS_PYXTAL = importlib.util.find_spec("pyxtal") is not None
 except Exception:
     _HAS_PYXTAL = False
 
@@ -479,6 +482,18 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "density_range": None,
         "post_gen_relax": {"mode": "none", "max_iter": 30, "step": 0.4},
 
+        # motif 生成（晶格无关的 CrystalNN 过滤）
+        "motif_hard_dmin": 1.5,
+        "motif_box_scale": 6.0,
+        "motif_box_size": None,
+        "motif_max_tries": 80,
+        "motif_max_cost": 8.0,
+        "motif_local_steps": 15,
+        "motif_perturb_sigma": 0.1,
+        "motif_short_dist_factor": 0.7,
+        "motif_w_cn": 1.0,
+        "motif_w_d": 1.0,
+
         # 表面起伏上限（Å），控制顶 / 底表面原子的 z 起伏；不再直接表示整体厚度
         "z_flat_tol": 0.3,
 
@@ -606,6 +621,17 @@ def load_settings(config_path: str) -> argparse.Namespace:
     params["min_bond_length_factor"] = float(params.get("min_bond_length_factor", 0.9))
     params["hard_sphere_radius_scale"] = float(params.get("hard_sphere_radius_scale", 0.95))
     params["motif_overlap_tol"] = float(params.get("motif_overlap_tol", 0.25))
+    params["motif_hard_dmin"] = float(params.get("motif_hard_dmin", defaults["motif_hard_dmin"]))
+    params["motif_box_scale"] = float(params.get("motif_box_scale", defaults["motif_box_scale"]))
+    box_size_raw = params.get("motif_box_size", defaults["motif_box_size"])
+    params["motif_box_size"] = float(box_size_raw) if box_size_raw not in (None, "None") else None
+    params["motif_max_tries"] = int(params.get("motif_max_tries", defaults["motif_max_tries"]))
+    params["motif_max_cost"] = float(params.get("motif_max_cost", defaults["motif_max_cost"]))
+    params["motif_local_steps"] = int(params.get("motif_local_steps", defaults["motif_local_steps"]))
+    params["motif_perturb_sigma"] = float(params.get("motif_perturb_sigma", defaults["motif_perturb_sigma"]))
+    params["motif_short_dist_factor"] = float(params.get("motif_short_dist_factor", defaults["motif_short_dist_factor"]))
+    params["motif_w_cn"] = float(params.get("motif_w_cn", defaults["motif_w_cn"]))
+    params["motif_w_d"] = float(params.get("motif_w_d", defaults["motif_w_d"]))
     if "vacuum_thickness" not in params and "vacuum_c" in params:
         params["vacuum_thickness"] = params["vacuum_c"]
     params["vacuum_thickness"] = float(params.get("vacuum_thickness", 20.0))
@@ -692,12 +718,6 @@ def ensure_vacuum_axis(struct: Structure,
                      [s.species for s in struct.sites],
                      [s.frac_coords for s in struct.sites],
                      coords_are_cartesian=False)
-
-
-def ensure_vacuum_c(struct: Structure, c_target_low=18.0, c_target_high=25.0) -> Structure:
-    target = 0.5 * (c_target_low + c_target_high)
-    buffer = max(target - c_target_low, c_target_high - target)
-    return ensure_vacuum_axis(struct, axis_index=2, target=target, buffer=buffer)
 
 
 def orthogonalize_lattice_to_axis(struct: Structure, axis_index: int = 2) -> Structure:
@@ -1146,23 +1166,6 @@ def count_cn_like_generic(struct: Structure,
     return CNs
 
 
-def min_any_pair_distance(struct: Structure) -> float:
-    """
-    任意两原子（所有元素、所有配对）的最近距离。
-    """
-    L = struct.lattice
-    frac = np.array([s.frac_coords for s in struct.sites])
-    n = len(struct.sites)
-    dmin = 1e9
-    for i in range(n):
-        for j in range(i + 1, n):
-            df = min_image_vec(frac[j] - frac[i])
-            d = np.linalg.norm(df @ L.matrix)
-            if d < dmin:
-                dmin = d
-    return float(dmin)
-
-
 def layer_thickness_angstrom(struct: Structure, axis_index: int = 2) -> float:
     """Return the slab thickness (Å) along the selected axis."""
 
@@ -1393,41 +1396,12 @@ def generate_supercell_matrices_2d(
 
 # ------------------------------ pyxtal 候选生成（自由晶格） ------------------------------
 
-def pyxtal_generate_candidates(sg: int,
-                               num_center: int,
-                               num_neighbor: int,
-                               center_species: str,
-                               neighbor_species: str,
-                               trials: int):
-    """
-    使用 pyxtal 在“指定空间群 + 指定元素配比”下自由生成晶格 + 原子排布。
-    """
-    if not _HAS_PYXTAL:
-        return []
-    cand = []
-    for _ in range(trials):
-        try:
-            xtl = _pyxtal()
-            xtl.from_random(
-                3,
-                sg,
-                [center_species, neighbor_species],
-                [num_center, num_neighbor],
-            )
-            st = xtl.to_pymatgen()
-            cand.append(st)
-        except Exception:
-            continue
-    return cand
-
-
 class CandidateGenerator:
     """
-    候选结构生成器（重构版）：
+    候选结构生成器（motif → 晶格 嵌入版）。
 
-    旧版：对每个 det，直接让 pyxtal 生成 num_center * det / num_neighbor * det 那么多原子。
-    新版：对每个 det，先用 pyxtal 生成“基胞”（原子数与输入 POSCAR 相同），
-          再用 pymatgen.Structure.make_supercell 按 det 对基胞在 a,b 平面扩胞。
+    新版：先在无晶格的立方盒中用 :class:`MotifBuilder` 生成 CrystalNN 认可的 motif，
+    再把 motif 嵌入 det2 对应的 2D 超胞晶格，交给后续流水线处理。
     """
 
     def __init__(
@@ -1436,55 +1410,96 @@ class CandidateGenerator:
         center_count_base: int,
         neighbor_count_base: int,
         supercell_mats_by_det: Dict[int, List[np.ndarray]],
+        ref_stats: dict,
+        cn_range: Tuple[int, int],
+        base_lattice: Lattice,
     ):
         self.args = args
         self.center_count_base = int(center_count_base)
         self.neighbor_count_base = int(neighbor_count_base)
         self.supercell_mats_by_det = supercell_mats_by_det
+        self.base_lattice = base_lattice
+
+        self.motif_builder = MotifBuilder(
+            args=args,
+            ref_stats=ref_stats,
+            cn_range=cn_range,
+            center_species=args.center_species,
+            neighbor_species=args.neighbor_species,
+        )
 
     def generate(self, sg: int, det2: int) -> List[Structure]:
-        """
-        针对给定空间群 sg 和面积倍数 det2，生成一批候选结构：
-
-        1. 使用 pyxtal.from_random(3, sg, [center, neighbor], [center_count_base, neighbor_count_base])
-           生成一个“基胞候选”结构 st0；
-        2. 从 det2 对应的 HNF 超胞矩阵列表中随机挑选一个 M；
-        3. 用 st0.make_supercell(M) 得到 det2 倍原子数的候选结构；
-        4. 重复 steps 1–3，直到 samples_per_sg 次（或 pyxtal 失败为止）。
-        """
-        if not _HAS_PYXTAL:
-            return []
+        """先生成 motif，再嵌入 det2 对应的 2D 超胞晶格。"""
 
         mats = self.supercell_mats_by_det.get(int(det2), [])
         if not mats:
             return []
 
-        cands: List[Structure] = []
         trials = int(self.args.samples_per_sg)
+        num_center = self.center_count_base * det2
+        num_neighbor = self.neighbor_count_base * det2
 
+        cands: List[Structure] = []
         for _ in range(trials):
-            # 1. 先生成基胞（原子数 = 输入 POSCAR 中 center/neighbor 的个数之和）
+            motif = self.motif_builder.build_motif(num_center, num_neighbor)
+            if motif is None:
+                continue
+            coords_cart, species, _ = motif
+
+            M = random.choice(mats)
+            super_lattice = Lattice(np.dot(M, self.base_lattice.matrix))
+
+            frac_coords, _ = self._embed_motif(coords_cart, super_lattice)
+            st = Structure(super_lattice, species, frac_coords, coords_are_cartesian=False)
+
             try:
-                xtl = _pyxtal()
-                xtl.from_random(
-                    3,
-                    sg,
-                    [self.args.center_species, self.args.neighbor_species],
-                    [self.center_count_base, self.neighbor_count_base],
+                st = ensure_vacuum_axis(
+                    st,
+                    axis_index=self.args.layer_axis_index,
+                    target=self.args.vacuum_thickness,
+                    buffer=self.args.vacuum_buffer,
                 )
-                st0 = xtl.to_pymatgen()
             except Exception:
-                # pyxtal 有时会失败，直接跳过这一次
                 continue
 
-            # 2. 选一个 HNF 超胞矩阵，对基胞扩胞
-            M = random.choice(mats)
-            st_super = st0.copy()
-            st_super.make_supercell(M)
-
-            cands.append(st_super)
+            cands.append(st)
 
         return cands
+
+    def _embed_motif(self, coords_cart: np.ndarray, lattice: Lattice):
+        """Embed lattice-free motif coordinates into the a–b plane of *lattice*.
+
+        1) 将 motif 重心移至平面中心；
+        2) 按 lattice 的 a、b 尺寸做安全缩放，使得 motif 远离周期边界；
+        3) 压缩 z，使其位于单层平面附近，再转为分数坐标。
+        """
+
+        coords = np.array(coords_cart, dtype=float)
+        coords -= np.mean(coords, axis=0)
+
+        a_len, b_len, _ = lattice.abc
+        span_xy = coords[:, :2].ptp(axis=0)
+        target_span = np.array([0.6 * a_len, 0.6 * b_len])
+        scale_xy = np.min(np.divide(target_span, np.maximum(span_xy, 1e-3)))
+        scale_xy = min(scale_xy, 1.5) if scale_xy > 0 else 1.0
+
+        coords[:, :2] *= scale_xy
+        coords[:, 2] = np.clip(
+            coords[:, 2],
+            -0.1 * self.args.layer_thickness_max,
+            0.1 * self.args.layer_thickness_max,
+        )
+
+        center_cart = lattice.get_cartesian_coords([0.5, 0.5, 0.5])
+        coords += center_cart
+
+        frac = lattice.get_fractional_coords(coords)
+        frac[:, 2] = (frac[:, 2] % 1.0)
+        meta = {
+            "scale_xy": scale_xy,
+            "span_xy": span_xy.tolist(),
+        }
+        return frac, meta
 
 
 
@@ -1764,19 +1779,6 @@ class CandidatePreprocessor:
             "target_min_distance": float(cfg.get("target_min_distance", 2.5)),
             "safety_margin": float(cfg.get("safety_margin", 0.0)),
         }
-
-    @staticmethod
-    def _pair_violation_reason(violation: Dict[str, object]) -> str:
-        spec_i = violation.get("species_i")
-        spec_j = violation.get("species_j")
-        dist = violation.get("distance")
-        thresh = violation.get("threshold")
-        return (
-            f"pair {spec_i}-{spec_j} 距离 {dist:.3f}Å < 阈值 {thresh:.3f}Å"
-            if dist is not None and thresh is not None
-            else "pair distance violation"
-        )
-
 
 class GeometryFilter:
     def __init__(self,
@@ -2107,7 +2109,7 @@ def main():
     total_targets = len(target_sgs)
     print(
         f"[INFO] 将尝试空间群 {total_targets} 个，"
-        f"扩胞倍数 det 列表：{det_list}；pyxtal 可用：{_HAS_PYXTAL}"
+        f"扩胞倍数 det 列表：{det_list}；motif 生成启用 CrystalNN 检查"
     )
 
     constraints = GeometryConstraints(args)
@@ -2116,6 +2118,9 @@ def main():
         center_count_base=center_count_base,
         neighbor_count_base=neighbor_count_base,
         supercell_mats_by_det=supercell_mats_by_det,
+        ref_stats=ref_stats,
+        cn_range=(cn_lo, cn_hi),
+        base_lattice=base.lattice,
     )
     preprocessor = CandidatePreprocessor(args, slab_projector, constraints)
     geom_filter = GeometryFilter(args, constraints, symprecs, slab_projector)
@@ -2151,24 +2156,15 @@ def main():
             matchers[sg] = StructureMatcher(ltol=0.2, stol=0.3, angle_tol=5.0,
                                             primitive_cell=True, scale=True)
 
-            for det2 in det_list:
-                n_atoms = base_n * det2
-                if n_atoms > args.max_atoms:
-                    continue
+        for det2 in det_list:
+            n_atoms = base_n * det2
+            if n_atoms > args.max_atoms:
+                continue
 
-                # 保留这两个变量只是为了方便 log 或调试（逻辑上不再直接传给 pyxtal）
-                num_center = center_count_base * det2
-                num_neighbor = neighbor_count_base * det2
-
-                if not _HAS_PYXTAL:
-                    append_log(log_path, f"[SKIP] det={det2}  未安装 pyxtal，无法生成候选结构")
-                    continue
-
-                # 新版：pyxtal 只生成“基胞”，扩胞由 pymatgen.make_supercell 完成
-                cands = generator.generate(sg, det2)
-                if not cands:
-                    append_log(log_path, f"[FAIL] det={det2}  pyxtal+扩胞 采样均失败")
-                    continue
+            cands = generator.generate(sg, det2)
+            if not cands:
+                append_log(log_path, f"[FAIL] det={det2}  motif→晶格 采样均失败")
+                continue
 
             for cand_idx, st_raw in enumerate(cands, 1):
                 debug_save(st_raw, det2, 1.0, "raw")
@@ -2346,7 +2342,7 @@ def main():
 
     print(f"[DONE] 输出目录：{os.path.abspath(outdir)}")
     if not _HAS_PYXTAL:
-        print("[WARN] 未安装 pyxtal：未进行 Wyckoff 组合采样；建议 `pip install pyxtal` 后重试。")
+        print("[WARN] 未安装 pyxtal：pyxtal 采样被跳过（motif 路径仍已执行）。")
 
 
 if __name__ == "__main__":
