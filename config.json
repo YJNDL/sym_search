@@ -1,98 +1,101 @@
 {
   "settings": {
-    "outdir": "out_gaas_sg26",
+    "outdir": "out",
     "structure_file": "GaSb_39.vasp",
 
     "center_species": "Ga",
     "neighbor_species": "Sb",
-    "cn_target": 4,
-    "cn_range": [3, 6],
+
+    "target_sgs": 26,
+    "exclude_sgs": [],
+
+    "bond_tol": 0.4,
 
     "vacuum_thickness": 20.0,
     "vacuum_buffer": 1.0,
-    "layer_axis": "c",
-    "slab_center": 0.5,
-    "layer_thickness": 4.0,
-    "layer_thickness_max": 5.0,
-    "reslab_after_relax": true,
 
-    "z_flat_tol": 2.0,
-    "surface_frac": 0.25,
-
-    "distance_filter": {
-      "enable": true,
-      "global_min_distance": 2.4,
-      "min_pair_dist_matrix": {
-        "Ga-Ga": 2.6,
-        "Ga-Sb": 2.3,
-        "Sb-Sb": 2.6
-      },
-      "auto_scale": {
-        "enable": true,
-        "safety_margin": 0.05,
-        "max_scale_factor": 1.5
-      }
-    },
-    "min_bond_length_factor": 0.9,
-    "hard_sphere_radius_scale": 0.95,
-    "reject_if_overlap": true,
-    "density_range": [0.01, 15.0],
-    "post_gen_relax": {"mode": "hard_sphere", "max_iter": 40, "step": 0.5},
-    "motif_overlap_tol": 0.25,
-
-    "bond_target_min": 2.2,
-    "bond_target_max": 2.8,
-    "enable_bond_scaling": true,
-
-    "bond_scaling_mode": "soft",
-    "bond_coverage_min": 0.8,
-
-    "min_pair_dist": 1.8,
-
-    "bond_tol": 0.4,
-    "w_cost_d": 1.0,
-    "w_cost_cn": 0.5,
+    "det_max": 2,
+    "max_atoms": 96,
+    "enable_sqrt3": true,
 
     "symprec": [0.001, 0.002, 0.005],
     "angle_tol": 0.5,
 
-    "det_max": 12,
-    "max_atoms": 96,
-    "enable_sqrt3": true,
-    "samples_per_sg": 50,
+    "cn_target": 4,
+    "cn_range": [3, 6],
+
+    "min_pair_dist": 1.8,
+    "min_pair_dist_matrix": {},
+    "min_bond_length_factor": 0.9,
+    "hard_sphere_radius_scale": 0.95,
+    "reject_if_overlap": true,
+    "motif_overlap_tol": 0.25,
+    "density_range": null,
+
+    "post_gen_relax": {
+      "mode": "none",
+      "max_iter": 30,
+      "step": 0.4
+    },
+
+    "z_flat_tol": 1.0,
+
+    "ab_scale": 0.05,
+    "ab_scale_samples": 3,
+
+    "samples_per_sg": 100,
     "topk": 3,
     "seed": 2025,
 
+    "layer_thickness": null,
+    "layer_thickness_max": 3.0,
+    "layer_axis": "c",
+    "slab_center": 0.5,
+    "reslab_after_relax": true,
+
     "debug_save_all_cands": true,
     "debug_save_rejected": true,
-    "debug_max_per_sg": 30,
-    "process_all_candidates": false,
+    "debug_max_per_sg": 50,
+
+    "bond_target_min": 2.2,
+    "bond_target_max": 2.8,
+    "enable_bond_scaling": true,
+    "bond_scaling_mode": "soft",
+    "bond_coverage_min": 0.8,
+
+    "w_cost_d": 1.0,
+    "w_cost_cn": 0.5,
+
+    "surface_frac": 0.25,
 
     "filters": {
       "enable_min_distance_filter": true,
       "min_interatomic_distance": 1.2
     },
+
+    "distance_auto_scale": {
+      "enable": true,
+      "target_min_distance": 2.5,
+      "safety_margin": 0.05
+    },
+
     "vacuum_filter": {
       "enable_vacuum_check": true,
-      "min_vacuum_thickness_angstrom": 8.0,
+      "min_vacuum_thickness_angstrom": 18.0,
       "vacuum_direction": "c"
     },
+
     "vacuum_auto_fix": {
       "enable_auto_fix": true,
-      "target_vacuum_thickness_angstrom": 15.0
+      "target_vacuum_thickness_angstrom": 18.0
     },
+
     "spacegroup_filter": {
       "enable_spacegroup_check_after_fix": true,
       "target_spacegroup_number": null,
       "target_spacegroup_symbol": null,
       "symprec": 0.001,
       "angle_tolerance": 5.0
-    },
-    "crystalnn_filter": {
-      "enable": true,
-      "distance_cutoff": 3.5,
-      "max_unphysical_bond_fraction": 0.1,
-      "min_global_distance_after_cnn": 2.4
     }
   }
 }
