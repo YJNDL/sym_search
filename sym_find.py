@@ -487,6 +487,7 @@ def load_settings(config_path: str) -> argparse.Namespace:
         "motif_box_scale": 6.0,
         "motif_box_size": None,
         "motif_max_tries": 80,
+        "motif_to_lattice_max_tries": 10,
         "motif_max_cost": 8.0,
         "motif_local_steps": 15,
         "motif_perturb_sigma": 0.1,
@@ -626,6 +627,9 @@ def load_settings(config_path: str) -> argparse.Namespace:
     box_size_raw = params.get("motif_box_size", defaults["motif_box_size"])
     params["motif_box_size"] = float(box_size_raw) if box_size_raw not in (None, "None") else None
     params["motif_max_tries"] = int(params.get("motif_max_tries", defaults["motif_max_tries"]))
+    params["motif_to_lattice_max_tries"] = int(params.get(
+        "motif_to_lattice_max_tries", defaults["motif_to_lattice_max_tries"]
+    ))
     params["motif_max_cost"] = float(params.get("motif_max_cost", defaults["motif_max_cost"]))
     params["motif_local_steps"] = int(params.get("motif_local_steps", defaults["motif_local_steps"]))
     params["motif_perturb_sigma"] = float(params.get("motif_perturb_sigma", defaults["motif_perturb_sigma"]))
@@ -1428,23 +1432,41 @@ class CandidateGenerator:
             neighbor_species=args.neighbor_species,
         )
 
+        self.last_motif_attempts: List[Dict[str, object]] = []
+        self.last_attempts: int = 0
+        self.first_success_attempt: Optional[int] = None
+
     def generate(self, sg: int, det2: int) -> List[Structure]:
         """先生成 motif，再嵌入 det2 对应的 2D 超胞晶格。"""
+
+        self.last_motif_attempts = []
+        self.last_attempts = 0
+        self.first_success_attempt = None
 
         mats = self.supercell_mats_by_det.get(int(det2), [])
         if not mats:
             return []
 
         trials = int(self.args.samples_per_sg)
+        max_tries = max(1, max(trials, int(getattr(self.args, "motif_to_lattice_max_tries", 10))))
         num_center = self.center_count_base * det2
         num_neighbor = self.neighbor_count_base * det2
 
         cands: List[Structure] = []
-        for _ in range(trials):
+        for attempt in range(max_tries):
+            self.last_attempts += 1
             motif = self.motif_builder.build_motif(num_center, num_neighbor)
             if motif is None:
                 continue
             coords_cart, species, _ = motif
+
+            motif_struct = self._wrap_motif_for_debug(coords_cart, species)
+            if motif_struct is not None:
+                self.last_motif_attempts.append({
+                    "attempt": attempt,
+                    "motif": motif_struct,
+                    "embedded": False,
+                })
 
             M = random.choice(mats)
             super_lattice = Lattice(np.dot(M, self.base_lattice.matrix))
@@ -1462,9 +1484,35 @@ class CandidateGenerator:
             except Exception:
                 continue
 
+            for rec in reversed(self.last_motif_attempts):
+                if rec.get("attempt") == attempt:
+                    rec["embedded"] = True
+                    break
+            if self.first_success_attempt is None:
+                self.first_success_attempt = attempt
             cands.append(st)
 
         return cands
+
+    def _wrap_motif_for_debug(self, coords_cart: np.ndarray, species: Sequence) -> Optional[Structure]:
+        coords = np.array(coords_cart, dtype=float)
+        if coords.size == 0:
+            return None
+
+        centered = coords - np.mean(coords, axis=0)
+        span = np.ptp(centered, axis=0)
+        max_span = float(np.max(span)) if span.size else 0.0
+        margin = max(10.0, max_span)
+        L = max(50.0, max_span * 4.0, max_span + 2 * margin)
+
+        lattice = Lattice.cubic(L)
+        shift = np.array([0.5 * L, 0.5 * L, 0.5 * L])
+        coords_box = centered + shift
+
+        try:
+            return Structure(lattice, species, coords_box, coords_are_cartesian=True)
+        except Exception:
+            return None
 
     def _embed_motif(self, coords_cart: np.ndarray, lattice: Lattice):
         """Embed lattice-free motif coordinates into the a–b plane of *lattice*.
@@ -2161,10 +2209,41 @@ def main():
             if n_atoms > args.max_atoms:
                 continue
 
+            min_vac = float(vacuum_filter_cfg.get("min_vacuum_thickness_angstrom", 8.0))
+            axis = vacuum_filter_cfg.get("vacuum_direction", "c")
+            axis_label = axis_index_to_label(axis_to_index(axis))
+            vacuum_check_enabled = vacuum_filter_cfg.get("enable_vacuum_check", True)
+            vacuum_target_cfg = float(vacuum_fix_cfg.get("target_vacuum_thickness_angstrom", max(min_vac, 0.0)))
+            vacuum_meta = {
+                "vacuum_min_required_angstrom": min_vac,  # config threshold for acceptance
+                "min_vacuum_thickness_angstrom": min_vac,
+                "vacuum_target_angstrom": vacuum_target_cfg,  # config target used by auto-fix
+                "target_vacuum_thickness_angstrom": vacuum_target_cfg,
+                "vacuum_axis": axis_label,
+                "vacuum_check_enabled": vacuum_check_enabled,
+            }
+
             cands = generator.generate(sg, det2)
+            for rec in generator.last_motif_attempts:
+                if rec.get("embedded"):
+                    continue
+                motif_struct = rec.get("motif")
+                if motif_struct is None:
+                    continue
+                tag = f"motif_fail_try{rec.get('attempt', -1):02d}"
+                debug_save(motif_struct, det2, 1.0, tag, accepted=False)
+
+            attempts_made = max(generator.last_attempts, len(generator.last_motif_attempts))
             if not cands:
-                append_log(log_path, f"[FAIL] det={det2}  motif→晶格 采样均失败")
+                append_log(log_path, f"[FAIL] det={det2}  motif→晶格 采样均失败 after {attempts_made} attempts")
                 continue
+
+            if generator.first_success_attempt is not None:
+                append_log(
+                    log_path,
+                    (f"[INFO] det={det2}  motif→晶格 succeeded after "
+                     f"{generator.first_success_attempt + 1} attempts (tried {attempts_made})"),
+                )
 
             for cand_idx, st_raw in enumerate(cands, 1):
                 debug_save(st_raw, det2, 1.0, "raw")
@@ -2178,14 +2257,12 @@ def main():
                     continue
 
                 vacuum_was_fixed = False
-                if vacuum_filter_cfg.get("enable_vacuum_check", True):
-                    min_vac = float(vacuum_filter_cfg.get("min_vacuum_thickness_angstrom", 8.0))
-                    axis = vacuum_filter_cfg.get("vacuum_direction", "c")
-                    axis_label = axis_index_to_label(axis_to_index(axis))
+                if vacuum_check_enabled:
                     has_vac, vac_thickness, vac_detail = has_sufficient_vacuum(current_struct, min_vac, axis)
+                    vacuum_meta["vacuum_thickness_after_check_angstrom"] = vac_thickness
                     if not has_vac:
                         if vacuum_fix_cfg.get("enable_auto_fix", False):
-                            target_vac = float(vacuum_fix_cfg.get("target_vacuum_thickness_angstrom", max(min_vac, 0.0)))
+                            target_vac = vacuum_target_cfg
                             try:
                                 fixed_struct, _ = auto_fix_vacuum_with_pymatgen(current_struct, target_vac, axis)
                             except Exception as exc:
@@ -2194,6 +2271,7 @@ def main():
                                 continue
 
                             has_vac, vac_thickness, vac_detail = has_sufficient_vacuum(fixed_struct, min_vac, axis)
+                            vacuum_meta["vacuum_thickness_after_fix_angstrom"] = vac_thickness
                             if not has_vac:
                                 append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  auto-fix vacuum insufficient: {vac_detail}")
                                 debug_save(fixed_struct, det2, 1.0, "vacuum_fix_fail")
@@ -2268,7 +2346,7 @@ def main():
                     debug_save(filt_res.struct or pre_res.struct, det2, pre_res.scale_ab, "geom_fail")
                     continue
 
-                combined_meta: Dict[str, object] = {}
+                combined_meta: Dict[str, object] = dict(vacuum_meta)
                 combined_meta.update(pre_res.metrics)
                 combined_meta.update(filt_res.metrics)
                 if "pair_min_after" in combined_meta:
@@ -2282,6 +2360,25 @@ def main():
 
                 prim = eval_res.primitive
                 meta = eval_res.meta
+
+                final_vac_ok, final_vac, final_vac_detail = has_sufficient_vacuum(prim, min_vac, axis)
+                if vacuum_check_enabled and not final_vac_ok:
+                    append_log(log_path, f"[FILTER] det={det2} cand={cand_idx}  final vacuum insufficient: {final_vac_detail}")
+                    debug_save(prim, det2, pre_res.scale_ab, "vacuum_fail_final")
+                    continue
+
+                # vacuum_thickness: final measured vacuum thickness (Å) along the configured axis, after all adjustments
+                meta.update({
+                    "vacuum_thickness": final_vac,
+                    "vacuum_thickness_final_angstrom": final_vac,
+                    # min_vacuum_thickness_angstrom: config threshold used for acceptance
+                    "vacuum_min_required_angstrom": min_vac,
+                    "min_vacuum_thickness_angstrom": min_vac,
+                    # target_vacuum_thickness_angstrom: config target value used during auto-fix
+                    "vacuum_target_angstrom": vacuum_target_cfg,
+                    "target_vacuum_thickness_angstrom": vacuum_target_cfg,
+                    "vacuum_axis": axis_label,
+                })
 
                 is_dup = any(matchers[sg].fit(prim, item["primitive"]) for item in found)
                 if is_dup:
