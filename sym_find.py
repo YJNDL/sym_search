@@ -136,6 +136,12 @@ def parse_pair_distance_matrix(raw) -> Dict[Tuple[str, str], float]:
 
     if isinstance(raw, dict):
         for key, val in raw.items():
+            # 支持 ("a", "b") 形式的键，方便在已经解析过的配置上再次调用
+            if isinstance(key, (tuple, list)) and len(key) == 2:
+                a, b = key
+                _store(str(a), str(b), val)
+                continue
+
             if isinstance(val, dict):
                 a = key
                 for b, dist in val.items():
